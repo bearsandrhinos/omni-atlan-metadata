@@ -189,7 +189,13 @@ def test_fetch_snapshot_parses_topics():
 
     snapshot = make_client().fetch_snapshot()
     assert snapshot["topics"] == [
-        {"modelId": "mod1", "name": "orders", "label": "Orders", "baseViewName": "orders_view"}
+        {
+            "modelId": "mod1",
+            "owningModelId": "mod1",
+            "name": "orders",
+            "label": "Orders",
+            "baseViewName": "orders_view",
+        }
     ]
 
 
@@ -531,6 +537,138 @@ def test_fetch_snapshot_topic_detail_failure_falls_back_to_yaml():
     assert topic["baseViewName"] == "orders_view"
     # Detail-only fields are absent when the topic API fails.
     assert "sourceTableName" not in topic
+
+
+# ---------------------------------------------------------------------------
+# Workbook topic canonicalization (owningModelId stamping)
+# ---------------------------------------------------------------------------
+
+@respx.mock
+def test_workbook_inherited_topic_owning_is_shared_model():
+    """A workbook whose mode=extension YAML doesn't list a topic file is treated
+    as inheriting it — owningModelId points to the base shared model."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(200, json={
+            "records": [
+                {"id": "shared1", "modelKind": "SHARED"},
+                {"id": "wb1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
+            ],
+            "pageInfo": {"hasNextPage": False},
+        })
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    yaml_body = "label: Orders\nbase_view_name: orders_view\n"
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/yaml", params={"mode": "combined"}).mock(
+        return_value=httpx.Response(200, json={"files": {"orders.topic": yaml_body}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/wb1/yaml", params={"mode": "combined"}).mock(
+        return_value=httpx.Response(200, json={"files": {"orders.topic": yaml_body}})
+    )
+    # Workbook's own extension layer is empty => topic is inherited, not overridden.
+    respx.get("https://test.omniapp.co/api/v1/models/wb1/yaml", params={"mode": "extension"}).mock(
+        return_value=httpx.Response(200, json={"files": {}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/wb1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+
+    snapshot = make_client().fetch_snapshot()
+    topics_by_model = {t["modelId"]: t for t in snapshot["topics"]}
+    assert topics_by_model["shared1"]["owningModelId"] == "shared1"
+    assert topics_by_model["wb1"]["owningModelId"] == "shared1"
+
+
+@respx.mock
+def test_workbook_overridden_topic_owning_is_workbook():
+    """A workbook whose extension YAML lists the topic file IS overriding it —
+    owningModelId stays the workbook so it gets its own canonical entity."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(200, json={
+            "records": [
+                {"id": "shared1", "modelKind": "SHARED"},
+                {"id": "wb1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
+            ],
+            "pageInfo": {"hasNextPage": False},
+        })
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    yaml_body = "label: Orders\nbase_view_name: orders_view\n"
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/yaml", params={"mode": "combined"}).mock(
+        return_value=httpx.Response(200, json={"files": {"orders.topic": yaml_body}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/wb1/yaml", params={"mode": "combined"}).mock(
+        return_value=httpx.Response(200, json={"files": {"orders.topic": yaml_body}})
+    )
+    # Refinement-prefix form (+orders.topic) — should normalize to `orders`.
+    respx.get("https://test.omniapp.co/api/v1/models/wb1/yaml", params={"mode": "extension"}).mock(
+        return_value=httpx.Response(200, json={"files": {"+orders.topic": yaml_body}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/wb1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+
+    snapshot = make_client().fetch_snapshot()
+    topics_by_model = {t["modelId"]: t for t in snapshot["topics"]}
+    assert topics_by_model["shared1"]["owningModelId"] == "shared1"
+    assert topics_by_model["wb1"]["owningModelId"] == "wb1"
+
+
+@respx.mock
+def test_workbook_extension_fetch_failure_keeps_workbook_owning():
+    """If the extension YAML fetch fails, we can't tell inherited from overridden —
+    fall back to owning==modelId (no canonicalization) to avoid dropping data."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(200, json={
+            "records": [
+                {"id": "wb1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
+            ],
+            "pageInfo": {"hasNextPage": False},
+        })
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    yaml_body = "label: Orders\nbase_view_name: orders_view\n"
+    respx.get("https://test.omniapp.co/api/v1/models/wb1/yaml", params={"mode": "combined"}).mock(
+        return_value=httpx.Response(200, json={"files": {"orders.topic": yaml_body}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/wb1/yaml", params={"mode": "extension"}).mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+    respx.get("https://test.omniapp.co/api/v1/models/wb1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
+
+    snapshot = make_client().fetch_snapshot()
+    assert snapshot["topics"][0]["owningModelId"] == "wb1"
 
 
 @respx.mock

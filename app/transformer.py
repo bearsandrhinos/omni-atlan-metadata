@@ -85,12 +85,24 @@ class OmniMetadataTransformer:
             if c.get("id") and c.get("database")
         }
 
+        # (raw_modelId, topic_name) -> owningModelId. A workbook that merely
+        # inherits a shared-model topic stamps owningModelId=baseModelId so all
+        # entity + Process builders resolve to the shared canonical QN. Topics
+        # the workbook actually redefines keep owning==modelId (their own).
+        # Used by Process builders to canonicalize tile references pulled from
+        # document detail (queryPresentations[].modelId).
+        topic_owner: dict[tuple[str, str], str] = {
+            (row["modelId"], row["name"]): row.get("owningModelId") or row["modelId"]
+            for row in topics
+            if row.get("modelId") and row.get("name")
+        }
+
         entities: list[dict[str, Any]] = []
         entities.extend(self._models(models, document_model_ids))
         entities.extend(self._topics(topics))
         entities.extend(self._folders(folders))
         entities.extend(self._documents(documents))
-        entities.extend(self._processes_topic_to_document(documents))
+        entities.extend(self._processes_topic_to_document(documents, topic_owner))
         entities.extend(
             self._processes_source_to_topic(
                 topics, model_to_connection, connection_to_database
@@ -204,13 +216,34 @@ class OmniMetadataTransformer:
         self,
         records: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        entities: list[dict[str, Any]] = []
+        """Emit OmniV01Topic entities keyed on the topic's OWNING model.
+
+        A workbook that inherits a shared-model topic without redefining it has
+        `owningModelId == baseModelId` (set upstream in client._fetch_topics_for_model).
+        All such rows collapse to a single QN; we prefer the row where
+        `owningModelId == modelId` (the canonical shared-model source) so the
+        Topic's `model` relationship points at the shared model. If the shared
+        row is missing (partial fetch), fall back to the first workbook row.
+        """
+        # Dedup by canonical QN; prefer the row whose owning matches its modelId.
+        chosen: dict[str, dict[str, Any]] = {}
         for row in records:
             model_id = row.get("modelId")
             topic_name = row.get("name")
             if not model_id or not topic_name:
                 continue
-            qn = self._topic_qn(model_id, topic_name)
+            owning = row.get("owningModelId") or model_id
+            qn = self._topic_qn(owning, topic_name)
+            existing = chosen.get(qn)
+            row_is_canonical = owning == model_id
+            existing_is_canonical = existing and existing.get("owningModelId", existing.get("modelId")) == existing.get("modelId")
+            if existing is None or (row_is_canonical and not existing_is_canonical):
+                chosen[qn] = row
+
+        entities: list[dict[str, Any]] = []
+        for qn, row in chosen.items():
+            topic_name = row["name"]
+            owning = row.get("owningModelId") or row["modelId"]
             attrs: dict[str, Any] = {
                 "qualifiedName": qn,
                 "name": row.get("label") or topic_name,
@@ -228,7 +261,7 @@ class OmniMetadataTransformer:
                     "typeName": "OmniV01Topic",
                     "attributes": attrs,
                     "relationshipAttributes": {
-                        "model": self._rel_ref("OmniV01Model", self._model_qn(model_id)),
+                        "model": self._rel_ref("OmniV01Model", self._model_qn(owning)),
                     },
                 }
             )
@@ -265,6 +298,9 @@ class OmniMetadataTransformer:
                 {
                     "typeName": "OmniV01Folder",
                     "attributes": attrs,
+                    "relationshipAttributes": {
+                        "connection": self._rel_ref("Connection", self.connection_qn),
+                    },
                 }
             )
         return entities
@@ -332,11 +368,15 @@ class OmniMetadataTransformer:
     def _processes_topic_to_document(
         self,
         documents: list[dict[str, Any]],
+        topic_owner: dict[tuple[str, str], str],
     ) -> list[dict[str, Any]]:
         """Emit Process entities for each (topic -> document) lineage edge.
 
         Topic-to-document edges come from `tileTopics` (deduped upstream in
-        client._fetch_document_detail). One Process per unique (topic, doc).
+        client._fetch_document_detail). We canonicalize each tile's raw
+        `modelId` to its `owningModelId` via `topic_owner` so an inherited
+        workbook topic reuses the shared model's canonical topic QN. One
+        Process per unique (owning_model, topic, doc).
         """
         entities: list[dict[str, Any]] = []
         for doc in documents:
@@ -351,13 +391,17 @@ class OmniMetadataTransformer:
                 topic_name = tile.get("topicName")
                 if not model_id or not topic_name:
                     continue
-                key = (model_id, topic_name)
+                # Canonicalize: prefer the owning model recorded upstream.
+                # Fall back to the raw model_id if we didn't enumerate the
+                # topic (filtered / snapshot mismatch).
+                owning = topic_owner.get((model_id, topic_name), model_id)
+                key = (owning, topic_name)
                 if key in seen:
                     continue
                 seen.add(key)
-                topic_qn = self._topic_qn(model_id, topic_name)
+                topic_qn = self._topic_qn(owning, topic_name)
                 process_qn = (
-                    f"{self.connection_qn}/process/topic/{model_id}/{topic_name}"
+                    f"{self.connection_qn}/process/topic/{owning}/{topic_name}"
                     f"/document/{identifier}"
                 )
                 entities.append(
@@ -384,15 +428,18 @@ class OmniMetadataTransformer:
     ) -> list[dict[str, Any]]:
         """Emit Process entities for each (source-table(s) -> topic) edge.
 
-        One Process per topic whose backing views resolve to a complete
-        warehouse table QN via the operator-supplied
-        atlan_source_connection_map. Falls back to the Omni connection's
-        `database` when a view has no `catalog` (single-database connectors).
+        Warehouse resolution keys on the ROW's own `modelId` (the workbook or
+        shared model that produced the topic) so we resolve the correct
+        atlan_source_connection_map entry / fallback database. The topic and
+        process QNs, however, are keyed on `owningModelId` — matching the
+        canonical OmniV01Topic emitted by `_topics`. Multiple workbook copies
+        of the same inherited topic dedup to a single Process.
         """
         if not self.atlan_source_connection_map:
             return []
 
         entities: list[dict[str, Any]] = []
+        seen_process_qns: set[str] = set()
         for row in topics:
             model_id = row.get("modelId")
             topic_name = row.get("name")
@@ -423,10 +470,14 @@ class OmniMetadataTransformer:
             if not input_refs:
                 continue
 
-            topic_qn = self._topic_qn(model_id, topic_name)
+            owning = row.get("owningModelId") or model_id
+            topic_qn = self._topic_qn(owning, topic_name)
             process_qn = (
-                f"{self.connection_qn}/process/source/topic/{model_id}/{topic_name}"
+                f"{self.connection_qn}/process/source/topic/{owning}/{topic_name}"
             )
+            if process_qn in seen_process_qns:
+                continue
+            seen_process_qns.add(process_qn)
             topic_label = row.get("label") or topic_name
             entities.append(
                 {

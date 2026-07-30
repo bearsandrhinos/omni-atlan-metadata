@@ -298,6 +298,17 @@ def test_topic_has_model_relationship():
     }
 
 
+def test_folder_has_connection_relationship():
+    """PART-1290: folders must emit relationshipAttributes so the calculate-diff
+    step doesn't choke on a null relationshipAttributes field."""
+    f = next(e for e in transform() if e["attributes"].get("omniV01Id") == "fold1")
+    assert "relationshipAttributes" in f
+    assert f["relationshipAttributes"]["connection"] == {
+        "typeName": "Connection",
+        "uniqueAttributes": {"qualifiedName": CONN_QN},
+    }
+
+
 def test_document_has_connection_and_folder_relationships():
     d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc1")
     rels = d["relationshipAttributes"]
@@ -464,3 +475,120 @@ def test_source_process_skipped_when_view_missing_schema_or_catalog():
         and e["attributes"]["qualifiedName"].startswith(f"{CONN_QN}/process/source/")
         for e in result
     )
+
+
+# ---------------------------------------------------------------------------
+# Workbook / shared-model topic canonicalization (PART-1355)
+# ---------------------------------------------------------------------------
+
+def _wb_snapshot(overridden: bool) -> dict:
+    """Shared model + workbook that either inherits or overrides `orders`."""
+    return {
+        "connections": [{"id": "c1", "name": "SF", "database": "analytics"}],
+        "models": [
+            {"id": "shared1", "name": "Shared", "modelKind": "SHARED", "connectionId": "c1"},
+            {"id": "wb1", "name": "WB", "modelKind": "WORKBOOK", "connectionId": "c1",
+             "baseModelId": "shared1"},
+        ],
+        "topics": [
+            {
+                "modelId": "shared1", "owningModelId": "shared1",
+                "name": "orders", "label": "Orders",
+                "viewSources": [{"viewName": "orders_view", "tableName": "orders",
+                                 "schema": "public", "catalog": "analytics"}],
+            },
+            {
+                "modelId": "wb1",
+                "owningModelId": "wb1" if overridden else "shared1",
+                "name": "orders",
+                "label": "Orders (WB override)" if overridden else "Orders",
+                "viewSources": [{"viewName": "orders_view", "tableName": "orders",
+                                 "schema": "public", "catalog": "analytics"}],
+            },
+        ],
+        "folders": [],
+        "documents": [
+            {"identifier": "doc1", "name": "Rev", "hasDashboard": True,
+             "tileTopics": [{"modelId": "wb1", "topicName": "orders"}]},
+        ],
+        "document_model_ids": [],
+    }
+
+
+def test_workbook_inherited_topic_deduped_to_shared_qn():
+    """Inherited workbook topic + its shared parent should collapse to one
+    OmniV01Topic under the shared model's QN."""
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(_wb_snapshot(overridden=False))
+    topics = [e for e in result if e["typeName"] == "OmniV01Topic"]
+    assert len(topics) == 1
+    assert topics[0]["attributes"]["qualifiedName"] == f"{CONN_QN}/model/shared1/topic/orders"
+    # Model relationship points at the shared model, not the workbook.
+    assert topics[0]["relationshipAttributes"]["model"]["uniqueAttributes"]["qualifiedName"] \
+        == f"{CONN_QN}/model/shared1"
+
+
+def test_workbook_overridden_topic_kept_separate():
+    """An actually-overridden workbook topic keeps its own QN — no dedup."""
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(_wb_snapshot(overridden=True))
+    topic_qns = {
+        e["attributes"]["qualifiedName"]
+        for e in result if e["typeName"] == "OmniV01Topic"
+    }
+    assert topic_qns == {
+        f"{CONN_QN}/model/shared1/topic/orders",
+        f"{CONN_QN}/model/wb1/topic/orders",
+    }
+
+
+def test_tile_topic_from_workbook_canonicalizes_to_shared_process():
+    """A tile whose modelId is the workbook must have its Process point at the
+    shared-model topic QN when the topic is inherited (not overridden)."""
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(_wb_snapshot(overridden=False))
+    processes = [
+        e for e in result if e["typeName"] == "Process"
+        and e["attributes"]["qualifiedName"].startswith(f"{CONN_QN}/process/topic/")
+    ]
+    assert len(processes) == 1
+    p = processes[0]
+    assert p["attributes"]["qualifiedName"] == f"{CONN_QN}/process/topic/shared1/orders/document/doc1"
+    assert p["relationshipAttributes"]["inputs"][0]["uniqueAttributes"]["qualifiedName"] \
+        == f"{CONN_QN}/model/shared1/topic/orders"
+
+
+def test_source_process_deduped_to_shared_topic():
+    """Warehouse -> topic Process emitted once per (owning_model, topic), not per
+    workbook copy."""
+    result = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        atlan_source_connection_map={"c1": "default/snowflake/1700"},
+    ).transform(_wb_snapshot(overridden=False))
+    source_procs = [
+        e for e in result if e["typeName"] == "Process"
+        and e["attributes"]["qualifiedName"].startswith(f"{CONN_QN}/process/source/")
+    ]
+    assert len(source_procs) == 1
+    assert source_procs[0]["attributes"]["qualifiedName"] \
+        == f"{CONN_QN}/process/source/topic/shared1/orders"
+    assert source_procs[0]["relationshipAttributes"]["outputs"][0]["uniqueAttributes"]["qualifiedName"] \
+        == f"{CONN_QN}/model/shared1/topic/orders"
+
+
+def test_tile_topic_uncatalogued_falls_back_to_raw_model_id():
+    """If the tile references a topic we never enumerated (filtered/absent from
+    the snapshot), the Process still emits using the raw model_id — no crash."""
+    snap = {
+        "connections": [],
+        "models": [{"id": "wb1", "name": "WB", "modelKind": "SHARED"}],
+        "topics": [],  # no topic enumerated
+        "folders": [],
+        "documents": [
+            {"identifier": "d1", "name": "D", "hasDashboard": True,
+             "tileTopics": [{"modelId": "wb1", "topicName": "unknown"}]},
+        ],
+        "document_model_ids": [],
+    }
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(snap)
+    procs = [e for e in result if e["typeName"] == "Process"]
+    assert len(procs) == 1
+    assert procs[0]["attributes"]["qualifiedName"] \
+        == f"{CONN_QN}/process/topic/wb1/unknown/document/d1"

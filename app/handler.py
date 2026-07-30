@@ -1,6 +1,4 @@
-import json
-from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 from application_sdk.handlers import HandlerInterface
 from application_sdk.observability.logger_adaptor import get_logger
@@ -30,16 +28,17 @@ class HandlerClass(HandlerInterface):
     async def preflight_check(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         # Server path: args[0] = body.model_dump() = {"credentials": {...}, "metadata": {...}}
         # Activities path: kwargs = {"credentials": {...}, "metadata": {...}}
-        data = args[0] if args and isinstance(args[0], dict) else {}
-        metadata = kwargs.get("metadata") or data.get("metadata") or {}
+        # Return the SDK's per-check shape ({<checkName>: {success, successMessage,
+        # failureMessage}}) — the setup UI iterates top-level keys expecting each
+        # to carry `.success`. A flat {success, message, data} caused the UI to
+        # render Data/Message/Success as "failed" even though the HTTP call was 200.
         self.client.list_connections()
         return {
-            "success": True,
-            "message": "Omni connection validated.",
-            "data": {
-                "page_size": metadata.get("page_size", 50),
-                "max_pages": metadata.get("max_pages"),
-            },
+            "connection": {
+                "success": True,
+                "successMessage": "Omni connection validated.",
+                "failureMessage": "Could not reach Omni with the provided base URL / token.",
+            }
         }
 
     async def fetch_metadata(self, *args: Any, **kwargs: Any) -> Any:
@@ -53,9 +52,3 @@ class HandlerClass(HandlerInterface):
             max_pages=max_pages,
             max_concurrency=max_concurrency,
         )
-
-    @staticmethod
-    async def get_configmap(config_map_id: str) -> Dict[str, Any]:
-        workflow_json_path = Path().cwd() / "app" / "frontend" / "workflow.json"
-        with open(workflow_json_path) as f:
-            return json.load(f)

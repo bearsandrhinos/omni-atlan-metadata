@@ -4,6 +4,61 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.9] - 2026-07-29
+
+Four issues surfaced by Atlan's demo-curation testing (PART-1290, PART-1355,
+PART-1221, PART-1079).
+
+### Fixed
+
+- **PART-1290 — `OmniV01Folder` publish crash on re-run.** Folders were the
+  only entity type emitted without a `relationshipAttributes` key, so the
+  serializer wrote `relationshipAttributes: null` and Atlan's calculate-diff
+  step choked on subsequent runs. Now emitted symmetrically with a
+  `connection` relationship — also parents folders to the Omni Connection.
+- **PART-1355 — Duplicate topics across shared + workbook models.** Omni's
+  combined-YAML endpoint merges a workbook's shared parent into its own
+  layer, so an inherited topic like `orders` was landing under 2–3
+  OmniV01Model QNs (once per workbook + the shared model). Per Omni
+  modeling docs, workbook topics *can* legitimately override inherited
+  ones via `extends`, so we can't blindly canonicalize. Fix:
+  - `client.py` — new `_overridden_topic_names(model_id)` uses
+    `mode=extension` (the workbook's own YAML layer) to detect real
+    overrides. Normalizes both plain (`orders.topic`) and refinement-prefixed
+    (`+orders.topic`) filenames.
+  - `client.py::_fetch_topics_for_model` — for WORKBOOK models, stamp
+    `owningModelId=baseModelId` on inherited topics and
+    `owningModelId=modelId` on overridden ones. If the extension fetch
+    fails, keep the workbook as owning (fail-safe: don't canonicalize).
+  - `transformer.py::_topics` — key OmniV01Topic QN off `owningModelId`,
+    dedup by QN, prefer the canonical (owning==modelId) row.
+  - `transformer.py::_processes_topic_to_document` — canonicalize each
+    tile's `modelId` through a `(modelId, topic) -> owningModelId` lookup
+    so Processes point at the canonical topic QN.
+  - `transformer.py::_processes_source_to_topic` — key process QN + topic
+    output on `owningModelId`, dedup by process QN. Warehouse-connection
+    resolution stays on the row's original `modelId` (that's where the
+    `viewSources` payload came from).
+- **PART-1221 — Preflight UI shows "checks failed" cosmetically.**
+  `handler.preflight_check` was returning a flat `{success, message, data}`;
+  the setup UI iterates top-level keys expecting each to carry `.success`.
+  Now returns the SDK's per-check shape:
+  `{"connection": {success, successMessage, failureMessage}}`.
+- **PART-1079 — Runtime tightening.** Removed the dead `handler.get_configmap()`
+  method (opened `app/frontend/workflow.json`, which the marketplace no longer
+  serves via this route — the form schema lives in marketplace-packages).
+  Tightened `extract_and_transform_metadata` `start_to_close_timeout` from
+  8h to 2h so hung runs surface faster.
+
+### Added
+
+- Client tests covering the three workbook-topic scenarios (inherited,
+  overridden with `+` prefix, extension-fetch failure fallback).
+- Transformer tests covering topic dedup to shared QN, override retention,
+  tile canonicalization, source-process dedup, and unenumerated-topic
+  fallback.
+- Handler test file (new) covering the per-check preflight shape.
+
 ## [0.2.8] - 2026-06-24
 
 **Date attribute fix.** v0.2.7 wrote `sourceUpdatedAt` as ISO-8601 strings

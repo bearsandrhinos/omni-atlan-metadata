@@ -284,6 +284,28 @@ class ClientClass:
                 break
         return rows
 
+    def _overridden_topic_names(self, model_id: str) -> set[str] | None:
+        """Return the set of topic names that a workbook REDEFINES in its own layer.
+
+        Uses mode=extension (the workbook's own YAML layer, not the merged combined
+        view) so we can tell inherited topics from actually-overridden ones. Both
+        plain filenames (order_analytics.topic) and refinement-prefixed ones
+        (+order_analytics.topic) are normalised to the bare stem.
+
+        Returns None on any error so callers can treat a failed fetch as
+        "don't canonicalize" (fail-safe).
+        """
+        try:
+            payload = self.get_model_yaml(model_id, mode="extension")
+            files = payload.get("files", {}) or {}
+            return {
+                f.removesuffix(".topic").split("/")[-1].lstrip("+")
+                for f in files
+                if f.endswith(".topic")
+            }
+        except Exception:
+            return None
+
     def _fetch_topics_for_model(self, model: dict[str, Any]) -> list[dict[str, Any]]:
         """Fetch and parse topics from a single model's YAML, enriched via the topic API.
 
@@ -291,6 +313,11 @@ class ClientClass:
         exists). For each topic, we additionally call the topic detail API to pull
         source-table/schema/catalog, joined views, and dimension/measure names.
         If the topic detail call fails, we still emit the basic topic from YAML.
+
+        For WORKBOOK models: topics that the workbook merely inherits from its
+        base shared model are stamped with owningModelId=baseModelId so the
+        transformer can collapse them to the shared-model's canonical QN. Topics
+        the workbook actually redefines keep owningModelId=model_id (their own).
         """
         model_id = model.get("id")
         if not model_id:
@@ -299,6 +326,12 @@ class ClientClass:
             payload = self.get_model_yaml(model_id, mode="combined")
         except Exception:
             return []
+
+        kind = str(model.get("modelKind") or "").upper()
+        base_model_id = model.get("baseModelId")
+        is_workbook = kind == "WORKBOOK" and bool(base_model_id)
+        overridden = self._overridden_topic_names(model_id) if is_workbook else None
+
         topics: list[dict[str, Any]] = []
         files = payload.get("files", {}) or {}
         for file_name, file_content in files.items():
@@ -315,8 +348,20 @@ class ClientClass:
             topic_name = parsed.get("name") or stem
             if not topic_name:
                 continue
+
+            # Determine canonical owning model. For an inherited (non-overridden)
+            # workbook topic, anchor to the base shared model so the transformer
+            # emits one OmniV01Topic per logical topic rather than one per workbook.
+            # If the extension-YAML fetch failed (overridden is None), be
+            # conservative and keep the workbook as owner (no canonicalization).
+            if is_workbook and overridden is not None and topic_name not in overridden:
+                owning_model_id = base_model_id
+            else:
+                owning_model_id = model_id
+
             topic = {
                 "modelId": model_id,
+                "owningModelId": owning_model_id,
                 "name": topic_name,
                 "label": parsed.get("label"),
                 "baseViewName": parsed.get("base_view") or parsed.get("base_view_name"),
