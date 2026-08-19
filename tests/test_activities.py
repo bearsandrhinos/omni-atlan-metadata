@@ -60,7 +60,7 @@ async def _call_get_workflow_args(workflow_config: dict, base_args: dict) -> dic
 async def test_defaults_when_state_empty():
     result = await _call_get_workflow_args({}, _make_base_args())
     assert result["metadata"]["connection_epoch_ms"] == DEFAULT_EPOCH
-    assert result["metadata"]["page_size"] == 50
+    assert result["metadata"]["page_size"] == 100
     assert result["metadata"]["max_pages"] is None
     assert result["metadata"]["save_output_local"] is False
     assert result["credentials"]["verify_ssl"] is True

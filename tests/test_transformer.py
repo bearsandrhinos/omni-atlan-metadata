@@ -178,7 +178,7 @@ def test_model_attributes_map_to_standard_asset_fields():
     assert attrs["connectorName"] == "omni"
     assert attrs["sourceUpdatedAt"] == 1704067200000
     assert attrs["omniV01ModelKind"] == "SHARED"
-    assert attrs["omniV01Scope"] == "ORGANIZATION"
+    assert "omniV01Scope" not in attrs  # /v1/models records carry no `scope`
 
 
 def test_document_uses_source_url_and_source_updated_at():
