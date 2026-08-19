@@ -38,6 +38,15 @@ timed out at 0.6% and then kept calling the Omni API for 9h44m unobserved).
 
 ### Fixed
 
+- **`joins` is parsed recursively.** The topic YAML's `joins` block nests views
+  under the view they join through, to arbitrary depth. Reading only the top
+  level captured a subset (2 of 4 views in Omni's own example) and emitted
+  partial source lineage without falling back. Every key at every depth is now
+  collected. Thanks to Omni for confirming the shape.
+- **A listing call that rejects `pageSize` halves and retries.** The cap is
+  per-endpoint: `/v1/documents` and `/v1/models` document a max of 100, but
+  `/v1/folders` documents none. On a 400 the page size halves rather than
+  failing the run at the top. Suggested by Omni.
 - **The extract activity could not observe its own timeout.** `fetch_metadata`
   is `async def` but called the synchronous `fetch_snapshot` directly, blocking
   the worker's event loop for the whole crawl — so no heartbeat could fire and

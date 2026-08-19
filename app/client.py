@@ -299,8 +299,25 @@ class ClientClass:
         rows: list[dict[str, Any]] = []
         cursor: str | None = None
         page = 0
+        # Omni's pageSize cap is per-endpoint, not global: /v1/documents and
+        # /v1/models document a max of 100, but /v1/folders documents none — 100
+        # works today, so the ceiling there is whatever the implementation
+        # currently allows (confirmed by Omni, 2026-08-19, who suggested this
+        # guard). On a 400 from a listing call, halve pageSize and retry rather
+        # than failing the whole run at the top.
+        effective_page_size = page_size
         while True:
-            response = list_fn(page_size=page_size, cursor=cursor)
+            try:
+                response = list_fn(page_size=effective_page_size, cursor=cursor)
+            except NonRetryableOmniApiError as exc:
+                if exc.status_code != 400 or effective_page_size <= 1:
+                    raise
+                effective_page_size = max(1, effective_page_size // 2)
+                logger.warning(
+                    f"Listing call rejected pageSize; halving to "
+                    f"{effective_page_size} and retrying ({exc})."
+                )
+                continue
             records, cursor = self._paginate(response)
             rows.extend(records)
             page += 1
@@ -440,21 +457,67 @@ class ClientClass:
     def _joined_view_names(parsed_topic: dict[str, Any]) -> list[str] | None:
         """View names a topic joins, read from the topic YAML's `joins` block.
 
-        Returns [] when the topic declares no joins. Returns None when a
-        `joins` key is present in a shape we do not recognise, which the caller
-        treats as "cannot derive locally" and answers with the topic-detail
-        call for that one topic rather than emitting partial lineage.
+        `joins` is a RECURSIVELY NESTED mapping: each view is nested under the
+        view it joins through, and a leaf ends with an empty object. Confirmed
+        by Omni, 2026-08-19:
+
+            joins:
+              inventory_items:            # included in the topic
+                products:                 # joined to inventory_items
+                  distribution_centers: {}  # joined to products
+              users: {}                   # included in the topic
+
+        All four of those views belong in the topic, so every key at every
+        depth is collected — reading only the top level would silently emit
+        partial source lineage (2 of the 4 above), which is worse than falling
+        back to the topic-detail call.
+
+        Returns [] when the topic declares no joins. Returns None when `joins`
+        is present in a shape we do not recognise, which the caller treats as
+        "cannot derive locally" and answers with the topic-detail call for that
+        one topic rather than emitting incomplete lineage.
+
+        Note: a topic may also redefine relationships scoped to itself. That
+        changes how views join, not WHICH views are included, so it does not
+        affect the view set this returns (and we model only table-level
+        lineage, not join semantics).
         """
         if "joins" not in parsed_topic:
             return []
         joins = parsed_topic.get("joins")
         if joins in (None, {}, []):
             return []
-        if isinstance(joins, dict):
-            return [str(key) for key in joins if key]
-        if isinstance(joins, list) and all(isinstance(j, str) for j in joins):
-            return [j for j in joins if j]
-        return None
+
+        names: list[str] = []
+        seen: set[str] = set()
+
+        def _walk(node: Any) -> bool:
+            """Collect view names depth-first. False = unrecognised shape."""
+            if node in (None, {}, []):
+                return True
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    if not key:
+                        continue
+                    name = str(key)
+                    if name not in seen:
+                        seen.add(name)
+                        names.append(name)
+                    if not _walk(child):
+                        return False
+                return True
+            # A list of bare view names is accepted as a leaf-only shape.
+            if isinstance(node, list) and all(isinstance(j, str) for j in node):
+                for j in node:
+                    if j and j not in seen:
+                        seen.add(j)
+                        names.append(j)
+                return True
+            return False
+
+        if not _walk(joins):
+            return None
+        return names
 
     def _topic_detail_from_views(
         self,
