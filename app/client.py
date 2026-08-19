@@ -527,8 +527,17 @@ class ClientClass:
     ) -> dict[str, Any] | None:
         """Build `_fetch_topic_detail`'s exact output shape from local `.view` data.
 
-        Returns None when the topic's joins cannot be read, so the caller can
-        fall back to the HTTP call for that topic alone.
+        Returns None when the topic's joins cannot be read, OR when any view the
+        topic references cannot be resolved from the payload — so the caller
+        falls back to the HTTP call for that topic alone.
+
+        The unresolvable-name case is not hypothetical: `joins` uses the
+        RELATIONSHIP'S ALIAS where a relationship is aliased, not the underlying
+        view name (confirmed by Omni, 2026-08-19). The alias mapping is declared
+        somewhere we do not yet parse, so an aliased join simply will not match a
+        `.view` we hold. Skipping it would emit source lineage that is silently
+        missing a table; falling back fetches complete detail from the topic API
+        for that topic instead. Fail safe rather than guess at the alias schema.
 
         `dimensionNames` / `measureNames` are emitted empty: their only source
         is the topic API's per-field `fully_qualified_name`, which `.view`
@@ -540,13 +549,24 @@ class ClientClass:
         joined = self._joined_view_names(parsed_topic)
         if joined is None:
             return None
-        base_view = views.get(base_view_name) or {} if base_view_name else {}
-        ordered = ([base_view_name] if base_view_name else []) + joined
+        # Base view first, then joins, each view once. The base view is normally
+        # also listed in `joins` (it is "included in the topic"), and the topic
+        # API returns each view exactly once — so de-dupe to match that shape
+        # rather than emitting a duplicate viewSources row for it.
+        ordered: list[str] = []
+        for name in ([base_view_name] if base_view_name else []) + joined:
+            if name and name not in ordered:
+                ordered.append(name)
         view_sources: list[dict[str, Any]] = []
         for view_name in ordered:
             view = views.get(view_name)
             if not isinstance(view, dict):
-                continue
+                # Unresolvable name — most likely a relationship alias. Give up on
+                # local derivation for this topic so the caller fetches complete
+                # detail from the API, rather than emitting partial lineage.
+                return None
+            # A view we DID resolve but that carries no `table_name` is legitimate
+            # (a derived view with no physical table); skip it, do not fall back.
             table_name = view.get("table_name")
             if not table_name:
                 continue
@@ -558,6 +578,7 @@ class ClientClass:
                     "catalog": view.get("catalog"),
                 }
             )
+        base_view = views.get(base_view_name) or {} if base_view_name else {}
         return {
             "sourceTableName": base_view.get("table_name"),
             "sourceSchema": base_view.get("schema"),

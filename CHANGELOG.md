@@ -43,6 +43,14 @@ timed out at 0.6% and then kept calling the Omni API for 9h44m unobserved).
   level captured a subset (2 of 4 views in Omni's own example) and emitted
   partial source lineage without falling back. Every key at every depth is now
   collected. Thanks to Omni for confirming the shape.
+- **An unresolvable view name in `joins` falls back instead of dropping a table.**
+  Where a relationship is aliased, `joins` names the alias rather than the
+  underlying view, so it will not match a `.view` in the payload. Deriving
+  locally would have emitted source lineage silently missing that table; the
+  topic now falls back to the topic-detail API. A view that *does* resolve but
+  carries no `table_name` is a derived view and is still skipped, not treated as
+  a miss. Also de-duplicates the base view, which is normally listed in `joins`
+  too, so `viewSources` matches the topic API's one-row-per-view shape.
 - **A listing call that rejects `pageSize` halves and retries.** The cap is
   per-endpoint: `/v1/documents` and `/v1/models` document a max of 100, but
   `/v1/folders` documents none. On a 400 the page size halves rather than
