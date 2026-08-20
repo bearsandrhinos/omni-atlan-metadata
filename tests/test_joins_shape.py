@@ -76,3 +76,61 @@ def test_unresolvable_base_view_also_falls_back():
     parsed = yaml.safe_load("joins:\n  orders: {}\n")
     got = c._topic_detail_from_views(parsed, "aliased_base", _views("orders"))
     assert got is None
+
+
+# --- alias RESOLUTION from the .relationships file (Omni, 2026-08-19) ---
+
+RELATIONSHIPS = """
+- join_from_view: users
+  join_from_view_as: buyers
+  join_from_view_as_label: Buyers
+  join_to_view: user_facts
+  join_type: always_left
+  on_sql: ${users.id} = ${user_facts.id}
+  relationship_type: one_to_one
+"""
+
+
+def test_alias_map_parsed_from_relationships_file():
+    got = ClientClass._view_aliases_from_payload({"model.relationships": RELATIONSHIPS})
+    assert got == {"buyers": "users"}, got
+
+
+def test_aliased_join_resolves_locally_instead_of_falling_back():
+    """The whole point: an aliased join no longer costs a topic-detail request."""
+    c = ClientClass()
+    parsed = yaml.safe_load("joins:\n  orders:\n    buyers: {}\n")
+    got = c._topic_detail_from_views(
+        parsed, "orders", _views("orders", "users"), {"buyers": "users"}
+    )
+    assert got is not None, "should resolve via alias, not fall back"
+    # `users`' table is present, reached through the alias `buyers`
+    assert "TBL_users" in [v["tableName"] for v in got["viewSources"]]
+
+
+def test_alias_pointing_at_a_view_we_lack_still_falls_back():
+    c = ClientClass()
+    parsed = yaml.safe_load("joins:\n  orders:\n    buyers: {}\n")
+    got = c._topic_detail_from_views(
+        parsed, "orders", _views("orders"), {"buyers": "users"}
+    )
+    assert got is None
+
+
+def test_aliased_base_view_resolves():
+    c = ClientClass()
+    parsed = yaml.safe_load("joins:\n  buyers: {}\n")
+    got = c._topic_detail_from_views(
+        parsed, "buyers", _views("users"), {"buyers": "users"}
+    )
+    assert got is not None
+    assert got["sourceTableName"] == "TBL_users"
+
+
+def test_no_relationships_file_yields_empty_alias_map():
+    assert ClientClass._view_aliases_from_payload({"a.view": "name: x"}) == {}
+
+
+def test_malformed_relationships_file_is_ignored_not_fatal():
+    assert ClientClass._view_aliases_from_payload({"m.relationships": ":::not yaml:::"}) == {}
+    assert ClientClass._view_aliases_from_payload({"m.relationships": "- join_to_view: only"}) == {}

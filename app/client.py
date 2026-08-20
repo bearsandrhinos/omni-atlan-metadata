@@ -381,6 +381,9 @@ class ClientClass:
         # alongside its `.topic` files, so every field the transformer consumes
         # can be derived locally instead of costing one HTTP call per topic.
         views = self._views_from_payload(files)
+        # Aliases ride in the same payload, so resolve them locally rather than
+        # falling back to the topic API for every aliased join.
+        view_aliases = self._view_aliases_from_payload(files)
         for file_name, file_content in files.items():
             if not file_name.endswith(".topic"):
                 continue
@@ -419,7 +422,9 @@ class ClientClass:
             # on the topic-detail endpoint — so no consumed field is ever
             # silently dropped.
             detail = (
-                self._topic_detail_from_views(parsed, topic["baseViewName"], views)
+                self._topic_detail_from_views(
+                    parsed, topic["baseViewName"], views, view_aliases
+                )
                 if views
                 else None
             )
@@ -428,6 +433,60 @@ class ClientClass:
             topic.update(detail)
             topics.append(topic)
         return topics
+
+    @staticmethod
+    def _view_aliases_from_payload(files: dict[str, Any]) -> dict[str, str]:
+        """Map a relationship alias -> the underlying view name.
+
+        `joins` names the relationship's ALIAS where one is defined, not the
+        view (confirmed by Omni, 2026-08-19). The alias is declared on the
+        relationship as `join_from_view_as`, alongside the real view in
+        `join_from_view`:
+
+            - join_from_view: users
+              join_from_view_as: buyers        # `joins` will say "buyers"
+              join_from_view_as_label: Buyers
+              join_to_view: user_facts
+              join_type: always_left
+              on_sql: ${users.id} = ${user_facts.id}
+              relationship_type: one_to_one
+
+        Relationship definitions ride along in the same combined-mode payload
+        (the `.relationships` file), so aliases resolve locally with no extra
+        request. Accepts either a bare list of relationship mappings or a dict
+        wrapping one under a `relationships`-style key, and ignores anything it
+        does not recognise — an unresolved alias simply falls through to the
+        topic-detail fallback rather than dropping a table.
+        """
+        aliases: dict[str, str] = {}
+
+        def _absorb(entry: Any) -> None:
+            if not isinstance(entry, dict):
+                return
+            alias = entry.get("join_from_view_as")
+            actual = entry.get("join_from_view")
+            if alias and actual:
+                aliases.setdefault(str(alias), str(actual))
+
+        for file_name, file_content in files.items():
+            if not file_name.endswith(".relationships"):
+                continue
+            try:
+                parsed = yaml.safe_load(file_content) or {}
+            except yaml.YAMLError:
+                continue
+            if isinstance(parsed, list):
+                for entry in parsed:
+                    _absorb(entry)
+            elif isinstance(parsed, dict):
+                for value in parsed.values():
+                    if isinstance(value, list):
+                        for entry in value:
+                            _absorb(entry)
+                    else:
+                        _absorb(value)
+                _absorb(parsed)
+        return aliases
 
     @staticmethod
     def _views_from_payload(files: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -524,6 +583,7 @@ class ClientClass:
         parsed_topic: dict[str, Any],
         base_view_name: str | None,
         views: dict[str, dict[str, Any]],
+        view_aliases: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         """Build `_fetch_topic_detail`'s exact output shape from local `.view` data.
 
@@ -557,13 +617,18 @@ class ClientClass:
         for name in ([base_view_name] if base_view_name else []) + joined:
             if name and name not in ordered:
                 ordered.append(name)
+        aliases = view_aliases or {}
         view_sources: list[dict[str, Any]] = []
         for view_name in ordered:
             view = views.get(view_name)
+            if not isinstance(view, dict) and view_name in aliases:
+                # `joins` named a relationship alias; resolve to the real view.
+                view = views.get(aliases[view_name])
             if not isinstance(view, dict):
-                # Unresolvable name — most likely a relationship alias. Give up on
-                # local derivation for this topic so the caller fetches complete
-                # detail from the API, rather than emitting partial lineage.
+                # Still unresolvable — an alias we could not map, or a view absent
+                # from the payload. Give up on local derivation for this topic so
+                # the caller fetches complete detail from the API, rather than
+                # emitting lineage that is silently missing a table.
                 return None
             # A view we DID resolve but that carries no `table_name` is legitimate
             # (a derived view with no physical table); skip it, do not fall back.
@@ -578,7 +643,11 @@ class ClientClass:
                     "catalog": view.get("catalog"),
                 }
             )
-        base_view = views.get(base_view_name) or {} if base_view_name else {}
+        base_view = (
+            views.get(base_view_name)
+            or views.get(aliases.get(base_view_name or "", ""))
+            or {}
+        ) if base_view_name else {}
         return {
             "sourceTableName": base_view.get("table_name"),
             "sourceSchema": base_view.get("schema"),

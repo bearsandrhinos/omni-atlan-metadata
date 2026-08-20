@@ -43,6 +43,12 @@ timed out at 0.6% and then kept calling the Omni API for 9h44m unobserved).
   level captured a subset (2 of 4 views in Omni's own example) and emitted
   partial source lineage without falling back. Every key at every depth is now
   collected. Thanks to Omni for confirming the shape.
+- **Relationship aliases resolve locally.** `joins` names a relationship's alias
+  where one is defined (`join_from_view_as`) rather than the underlying view
+  (`join_from_view`). Those definitions ride in the same combined-mode payload's
+  `.relationships` file, so the alias map is built from it and aliased joins
+  resolve with no extra request. An alias we still cannot map falls back rather
+  than dropping a table.
 - **An unresolvable view name in `joins` falls back instead of dropping a table.**
   Where a relationship is aliased, `joins` names the alias rather than the
   underlying view, so it will not match a `.view` in the payload. Deriving
