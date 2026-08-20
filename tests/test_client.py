@@ -554,7 +554,7 @@ def test_workbook_inherited_topic_owning_is_shared_model():
         return_value=httpx.Response(200, json={
             "records": [
                 {"id": "shared1", "modelKind": "SHARED"},
-                {"id": "wb1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
+                {"id": "wb1", "name": "Workbook 1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
             ],
             "pageInfo": {"hasNextPage": False},
         })
@@ -600,7 +600,7 @@ def test_workbook_overridden_topic_owning_is_workbook():
         return_value=httpx.Response(200, json={
             "records": [
                 {"id": "shared1", "modelKind": "SHARED"},
-                {"id": "wb1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
+                {"id": "wb1", "name": "Workbook 1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
             ],
             "pageInfo": {"hasNextPage": False},
         })
@@ -645,7 +645,7 @@ def test_workbook_extension_fetch_failure_keeps_workbook_owning():
     respx.get("https://test.omniapp.co/api/v1/models").mock(
         return_value=httpx.Response(200, json={
             "records": [
-                {"id": "wb1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
+                {"id": "wb1", "name": "Workbook 1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
             ],
             "pageInfo": {"hasNextPage": False},
         })

@@ -187,9 +187,10 @@ class OmniMetadataTransformer:
             description = row.get("description")
             if description:
                 attrs["description"] = description
-            scope = self._normalize_enum(row.get("scope"), _SCOPES)
-            if scope:
-                attrs["omniV01Scope"] = scope
+            # No `scope` on /v1/models records (verified against the live API:
+            # baseModelId, connectionId, createdAt, deletedAt, id, modelKind,
+            # name, updatedAt — that is the whole record). The read could only
+            # ever yield None. Folders and documents keep theirs.
             owner_users = self._owner_users(row.get("owner") or {"name": row.get("ownerName")})
             if owner_users:
                 attrs["ownerUsers"] = owner_users

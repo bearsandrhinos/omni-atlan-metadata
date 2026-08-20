@@ -4,6 +4,75 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Extraction performance and run observability, from an Atlan investigation of a
+large-tenant run that could not complete (19,937 models; ~928,000 API requests;
+timed out at 0.6% and then kept calling the Omni API for 9h44m unobserved).
+
+### Changed
+
+- **Topic enrichment no longer costs an HTTP call per topic.** The combined-mode
+  model YAML already carries the model's `.view` files, so `viewSources` (and the
+  source table/schema/catalog) are derived locally. The `/v1/models/{id}/topic/
+  {name}` endpoint is now only called when a topic's joins cannot be read from
+  the payload. Largest single saving: ~897,000 requests on the tenant above.
+- **Shadow workbook models no longer pay the YAML fan-out.** An unnamed
+  `WORKBOOK` that no document points at is skipped — the same predicate
+  `transformer._models` already applies when deciding which models become
+  entities. Their topics are byte-identical copies of the `SHARED` parent's.
+- **Document details are fetched before model YAMLs.** Previously both batches
+  shared one FIFO pool with models submitted first, so on a large tenant the
+  document futures never ran (`docs 0/264` after 12 hours).
+- **`page_size` default 50 -> 100** (Omni's documented maximum).
+- **`extract_and_transform_metadata` timeout restored to 8h** (was 2h). The
+  heartbeat added below is what surfaces a hung run now, so the ceiling's only
+  job is to bound total work.
+- **`extract_retry_policy` `maximum_attempts` 2 -> 1.** A retry restarts the
+  crawl from zero, so on a multi-hour extraction it costs a second full window
+  of source-API load for little benefit. Worth raising again once the fetch can
+  checkpoint and resume.
+- **A burst `403` is now retried rather than fatal.** The API answers a rapid
+  burst with `403 "Invalid bearer token"` rather than `429`, which the client
+  was classifying as non-retryable.
+
+### Fixed
+
+- **`joins` is parsed recursively.** The topic YAML's `joins` block nests views
+  under the view they join through, to arbitrary depth. Reading only the top
+  level captured a subset (2 of 4 views in Omni's own example) and emitted
+  partial source lineage without falling back. Every key at every depth is now
+  collected. Thanks to Omni for confirming the shape.
+- **Relationship aliases resolve locally.** `joins` names a relationship's alias
+  where one is defined (`join_from_view_as`) rather than the underlying view
+  (`join_from_view`). Those definitions ride in the same combined-mode payload's
+  `.relationships` file, so the alias map is built from it and aliased joins
+  resolve with no extra request. An alias we still cannot map falls back rather
+  than dropping a table.
+- **An unresolvable view name in `joins` falls back instead of dropping a table.**
+  Where a relationship is aliased, `joins` names the alias rather than the
+  underlying view, so it will not match a `.view` in the payload. Deriving
+  locally would have emitted source lineage silently missing that table; the
+  topic now falls back to the topic-detail API. A view that *does* resolve but
+  carries no `table_name` is a derived view and is still skipped, not treated as
+  a miss. Also de-duplicates the base view, which is normally listed in `joins`
+  too, so `viewSources` matches the topic API's one-row-per-view shape.
+- **A listing call that rejects `pageSize` halves and retries.** The cap is
+  per-endpoint: `/v1/documents` and `/v1/models` document a max of 100, but
+  `/v1/folders` documents none. On a 400 the page size halves rather than
+  failing the run at the top. Suggested by Omni.
+- **The extract activity could not observe its own timeout.** `fetch_metadata`
+  is `async def` but called the synchronous `fetch_snapshot` directly, blocking
+  the worker's event loop for the whole crawl — so no heartbeat could fire and
+  the Temporal timeout was never delivered. It now runs via `asyncio.to_thread`
+  with a cooperative abort so cancellation drains within one in-flight request.
+- **Added `heartbeat_timeout` (5 min) and `@auto_heartbeater`** to the extract
+  activity, matching the pattern used by other connectors on this SDK.
+- **Removed a dead `scope` read on model records.** `/v1/models` returns
+  `baseModelId, connectionId, createdAt, deletedAt, id, modelKind, name,
+  updatedAt` — there is no `scope` field, so `omniV01Scope` could only ever be
+  unset on models. Folders and documents are unaffected.
+
 ## [0.2.9] - 2026-07-29
 
 Four issues surfaced by Atlan's demo-curation testing (PART-1290, PART-1355,

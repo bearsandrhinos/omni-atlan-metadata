@@ -7,6 +7,7 @@ from app.client import NonRetryableOmniApiError, OmniApiError
 from app.handler import HandlerClass
 from app.transformer import OmniMetadataTransformer
 from application_sdk.activities import ActivitiesInterface
+from application_sdk.activities.common.utils import auto_heartbeater
 from application_sdk.constants import TEMPORARY_PATH
 from application_sdk.io.json import JsonFileWriter
 from application_sdk.observability.logger_adaptor import get_logger
@@ -89,7 +90,7 @@ class ActivitiesClass(ActivitiesInterface):
                 "form field for local playground runs.",
                 non_retryable=True,
             )
-        page_size_raw = _form_value("page_size") or 50
+        page_size_raw = _form_value("page_size") or 100
         max_pages_raw = _form_value("max_pages")
         timeout_raw = _form_value("timeout_seconds") or 30
         max_concurrency_raw = _form_value("max_concurrency") or 10
@@ -128,7 +129,7 @@ class ActivitiesClass(ActivitiesInterface):
             save_output_raw = True
 
         metadata: dict[str, Any] = {
-            "page_size": _to_int(page_size_raw, 50),
+            "page_size": _to_int(page_size_raw, 100),
             "max_pages": _to_int(max_pages_raw, None),
             "connection_epoch_ms": connection_epoch_ms,
             "output_file": _form_value("output_file") or "omni_entities.ndjson",
@@ -164,6 +165,7 @@ class ActivitiesClass(ActivitiesInterface):
         }
 
     @activity.defn
+    @auto_heartbeater
     async def extract_and_transform_metadata(
         self, args: Dict[str, Any]
     ) -> Dict[str, Any]:

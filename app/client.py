@@ -3,10 +3,11 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 import random
 import threading
 import time
-from typing import Any
+from typing import Any, Sequence
 
 import httpx
 import yaml
@@ -17,6 +18,9 @@ logger = get_logger(__name__)
 # Omni's documented API rate limit. Each request gates through a token bucket
 # so concurrent threads collectively respect the cap.
 OMNI_DEFAULT_RPM = 60
+
+# Omni rejects anything larger with "Page size cannot exceed 100".
+OMNI_MAX_PAGE_SIZE = 100
 
 
 class _RateLimiter:
@@ -90,6 +94,9 @@ class ClientClass:
         self._credentials: OmniCredentials | None = None
         self._http_client: httpx.Client | None = None
         self._rate_limiter = _RateLimiter(rpm)
+        # Set by fetch_snapshot; lets a Temporal cancellation drain the thread
+        # pool instead of the pool outliving the activity (see handler).
+        self._abort: threading.Event | None = None
         if credentials:
             self.load_credentials(credentials)
 
@@ -158,6 +165,13 @@ class ClientClass:
         max_server_error_retries = 2
 
         for attempt in range(max_rate_limit_retries + 1):
+            # Single choke point for cooperative cancellation: once the activity
+            # is cancelled no queued worker issues another customer API call.
+            if self._abort is not None and self._abort.is_set():
+                raise OmniApiError(
+                    f"GET {path} aborted: extraction was cancelled.",
+                    retryable=True,
+                )
             self._rate_limiter.acquire()
             try:
                 response = self._client().get(path, params=params or {})
@@ -182,7 +196,9 @@ class ClientClass:
                     )
                 return data
 
-            if status == 429:
+            # Omni answers a rapid burst with 403 "Invalid bearer token", not
+            # 429, so 403 must back off and retry rather than hard-fail the run.
+            if status in (403, 429):
                 if attempt < max_rate_limit_retries:
                     # Honor Retry-After if Omni sends it; else fall back to
                     # jittered exponential backoff.
@@ -229,10 +245,20 @@ class ClientClass:
         data = self._get_json("/v1/connections")
         return data.get("connections", []) or []
 
-    def list_models(self, page_size: int = 50, cursor: str | None = None) -> dict[str, Any]:
+    def list_models(
+        self,
+        page_size: int = 50,
+        cursor: str | None = None,
+        model_kind: str | None = None,
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {"pageSize": page_size}
         if cursor:
             params["cursor"] = cursor
+        # Omni filters server-side on `modelKind` (note: `kind` is rejected with
+        # "Unrecognized key"). Left unset the listing returns every kind, which
+        # is the default so a new model kind can never be silently dropped.
+        if model_kind:
+            params["modelKind"] = model_kind
         return self._get_json("/v1/models", params=params)
 
     def list_folders(self, page_size: int = 50, cursor: str | None = None) -> dict[str, Any]:
@@ -273,8 +299,25 @@ class ClientClass:
         rows: list[dict[str, Any]] = []
         cursor: str | None = None
         page = 0
+        # Omni's pageSize cap is per-endpoint, not global: /v1/documents and
+        # /v1/models document a max of 100, but /v1/folders documents none — 100
+        # works today, so the ceiling there is whatever the implementation
+        # currently allows (confirmed by Omni, 2026-08-19, who suggested this
+        # guard). On a 400 from a listing call, halve pageSize and retry rather
+        # than failing the whole run at the top.
+        effective_page_size = page_size
         while True:
-            response = list_fn(page_size=page_size, cursor=cursor)
+            try:
+                response = list_fn(page_size=effective_page_size, cursor=cursor)
+            except NonRetryableOmniApiError as exc:
+                if exc.status_code != 400 or effective_page_size <= 1:
+                    raise
+                effective_page_size = max(1, effective_page_size // 2)
+                logger.warning(
+                    f"Listing call rejected pageSize; halving to "
+                    f"{effective_page_size} and retrying ({exc})."
+                )
+                continue
             records, cursor = self._paginate(response)
             rows.extend(records)
             page += 1
@@ -334,6 +377,13 @@ class ClientClass:
 
         topics: list[dict[str, Any]] = []
         files = payload.get("files", {}) or {}
+        # The combined-mode payload already contains this model's `.view` files
+        # alongside its `.topic` files, so every field the transformer consumes
+        # can be derived locally instead of costing one HTTP call per topic.
+        views = self._views_from_payload(files)
+        # Aliases ride in the same payload, so resolve them locally rather than
+        # falling back to the topic API for every aliased join.
+        view_aliases = self._view_aliases_from_payload(files)
         for file_name, file_content in files.items():
             if not file_name.endswith(".topic"):
                 continue
@@ -366,9 +416,247 @@ class ClientClass:
                 "label": parsed.get("label"),
                 "baseViewName": parsed.get("base_view") or parsed.get("base_view_name"),
             }
-            topic.update(self._fetch_topic_detail(model_id, topic_name))
+            # Derive the enrichment fields from the `.view` files in hand. Only
+            # if that is impossible for this topic (no `.view` files in the
+            # payload, or a `joins` block we cannot read) do we spend a request
+            # on the topic-detail endpoint — so no consumed field is ever
+            # silently dropped.
+            detail = (
+                self._topic_detail_from_views(
+                    parsed, topic["baseViewName"], views, view_aliases
+                )
+                if views
+                else None
+            )
+            if detail is None:
+                detail = self._fetch_topic_detail(model_id, topic_name)
+            topic.update(detail)
             topics.append(topic)
         return topics
+
+    @staticmethod
+    def _view_aliases_from_payload(files: dict[str, Any]) -> dict[str, str]:
+        """Map a relationship alias -> the underlying view name.
+
+        `joins` names the relationship's ALIAS where one is defined, not the
+        view (confirmed by Omni, 2026-08-19). The alias is declared on the
+        relationship as `join_from_view_as`, alongside the real view in
+        `join_from_view`:
+
+            - join_from_view: users
+              join_from_view_as: buyers        # `joins` will say "buyers"
+              join_from_view_as_label: Buyers
+              join_to_view: user_facts
+              join_type: always_left
+              on_sql: ${users.id} = ${user_facts.id}
+              relationship_type: one_to_one
+
+        Relationship definitions ride along in the same combined-mode payload
+        (the `.relationships` file), so aliases resolve locally with no extra
+        request. Accepts either a bare list of relationship mappings or a dict
+        wrapping one under a `relationships`-style key, and ignores anything it
+        does not recognise — an unresolved alias simply falls through to the
+        topic-detail fallback rather than dropping a table.
+        """
+        aliases: dict[str, str] = {}
+
+        def _absorb(entry: Any) -> None:
+            if not isinstance(entry, dict):
+                return
+            alias = entry.get("join_from_view_as")
+            actual = entry.get("join_from_view")
+            if alias and actual:
+                aliases.setdefault(str(alias), str(actual))
+
+        for file_name, file_content in files.items():
+            if not file_name.endswith(".relationships"):
+                continue
+            try:
+                parsed = yaml.safe_load(file_content) or {}
+            except yaml.YAMLError:
+                continue
+            if isinstance(parsed, list):
+                for entry in parsed:
+                    _absorb(entry)
+            elif isinstance(parsed, dict):
+                for value in parsed.values():
+                    if isinstance(value, list):
+                        for entry in value:
+                            _absorb(entry)
+                    else:
+                        _absorb(value)
+                _absorb(parsed)
+        return aliases
+
+    @staticmethod
+    def _views_from_payload(files: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Parse the `.view` files carried in a combined-mode YAML payload.
+
+        Keyed on the bare view name. Observed filename convention is
+        "<CATALOG>.<SCHEMA>/<view_name>.view" (e.g.
+        "WIDE_WORLD_IMPORTERS.PROCESSED_GOLD/dim_customer.view"); the directory
+        prefix only restates catalog/schema, both of which the view body also
+        carries, so the stem is all we need for lookup.
+        """
+        views: dict[str, dict[str, Any]] = {}
+        for file_name, file_content in files.items():
+            if not file_name.endswith(".view"):
+                continue
+            try:
+                parsed = yaml.safe_load(file_content) or {}
+            except yaml.YAMLError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            stem = file_name.removesuffix(".view").split("/")[-1]
+            views[str(parsed.get("name") or stem)] = parsed
+        return views
+
+    @staticmethod
+    def _joined_view_names(parsed_topic: dict[str, Any]) -> list[str] | None:
+        """View names a topic joins, read from the topic YAML's `joins` block.
+
+        `joins` is a RECURSIVELY NESTED mapping: each view is nested under the
+        view it joins through, and a leaf ends with an empty object. Confirmed
+        by Omni, 2026-08-19:
+
+            joins:
+              inventory_items:            # included in the topic
+                products:                 # joined to inventory_items
+                  distribution_centers: {}  # joined to products
+              users: {}                   # included in the topic
+
+        All four of those views belong in the topic, so every key at every
+        depth is collected — reading only the top level would silently emit
+        partial source lineage (2 of the 4 above), which is worse than falling
+        back to the topic-detail call.
+
+        Returns [] when the topic declares no joins. Returns None when `joins`
+        is present in a shape we do not recognise, which the caller treats as
+        "cannot derive locally" and answers with the topic-detail call for that
+        one topic rather than emitting incomplete lineage.
+
+        Note: a topic may also redefine relationships scoped to itself. That
+        changes how views join, not WHICH views are included, so it does not
+        affect the view set this returns (and we model only table-level
+        lineage, not join semantics).
+        """
+        if "joins" not in parsed_topic:
+            return []
+        joins = parsed_topic.get("joins")
+        if joins in (None, {}, []):
+            return []
+
+        names: list[str] = []
+        seen: set[str] = set()
+
+        def _walk(node: Any) -> bool:
+            """Collect view names depth-first. False = unrecognised shape."""
+            if node in (None, {}, []):
+                return True
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    if not key:
+                        continue
+                    name = str(key)
+                    if name not in seen:
+                        seen.add(name)
+                        names.append(name)
+                    if not _walk(child):
+                        return False
+                return True
+            # A list of bare view names is accepted as a leaf-only shape.
+            if isinstance(node, list) and all(isinstance(j, str) for j in node):
+                for j in node:
+                    if j and j not in seen:
+                        seen.add(j)
+                        names.append(j)
+                return True
+            return False
+
+        if not _walk(joins):
+            return None
+        return names
+
+    def _topic_detail_from_views(
+        self,
+        parsed_topic: dict[str, Any],
+        base_view_name: str | None,
+        views: dict[str, dict[str, Any]],
+        view_aliases: dict[str, str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Build `_fetch_topic_detail`'s exact output shape from local `.view` data.
+
+        Returns None when the topic's joins cannot be read, OR when any view the
+        topic references cannot be resolved from the payload — so the caller
+        falls back to the HTTP call for that topic alone.
+
+        The unresolvable-name case is not hypothetical: `joins` uses the
+        RELATIONSHIP'S ALIAS where a relationship is aliased, not the underlying
+        view name (confirmed by Omni, 2026-08-19). The alias mapping is declared
+        somewhere we do not yet parse, so an aliased join simply will not match a
+        `.view` we hold. Skipping it would emit source lineage that is silently
+        missing a table; falling back fetches complete detail from the topic API
+        for that topic instead. Fail safe rather than guess at the alias schema.
+
+        `dimensionNames` / `measureNames` are emitted empty: their only source
+        is the topic API's per-field `fully_qualified_name`, which `.view`
+        bodies do not carry. Neither field has a consumer anywhere in `app/`
+        and `typedefs.py` declares no dimension/measure attribute, so nothing
+        downstream observes the difference. Flagged rather than reconstructed —
+        we will not invent an FQN format we have not verified.
+        """
+        joined = self._joined_view_names(parsed_topic)
+        if joined is None:
+            return None
+        # Base view first, then joins, each view once. The base view is normally
+        # also listed in `joins` (it is "included in the topic"), and the topic
+        # API returns each view exactly once — so de-dupe to match that shape
+        # rather than emitting a duplicate viewSources row for it.
+        ordered: list[str] = []
+        for name in ([base_view_name] if base_view_name else []) + joined:
+            if name and name not in ordered:
+                ordered.append(name)
+        aliases = view_aliases or {}
+        view_sources: list[dict[str, Any]] = []
+        for view_name in ordered:
+            view = views.get(view_name)
+            if not isinstance(view, dict) and view_name in aliases:
+                # `joins` named a relationship alias; resolve to the real view.
+                view = views.get(aliases[view_name])
+            if not isinstance(view, dict):
+                # Still unresolvable — an alias we could not map, or a view absent
+                # from the payload. Give up on local derivation for this topic so
+                # the caller fetches complete detail from the API, rather than
+                # emitting lineage that is silently missing a table.
+                return None
+            # A view we DID resolve but that carries no `table_name` is legitimate
+            # (a derived view with no physical table); skip it, do not fall back.
+            table_name = view.get("table_name")
+            if not table_name:
+                continue
+            view_sources.append(
+                {
+                    "viewName": view_name,
+                    "tableName": table_name,
+                    "schema": view.get("schema"),
+                    "catalog": view.get("catalog"),
+                }
+            )
+        base_view = (
+            views.get(base_view_name)
+            or views.get(aliases.get(base_view_name or "", ""))
+            or {}
+        ) if base_view_name else {}
+        return {
+            "sourceTableName": base_view.get("table_name"),
+            "sourceSchema": base_view.get("schema"),
+            "sourceCatalog": base_view.get("catalog"),
+            "joinedViewNames": joined,
+            "dimensionNames": [],
+            "measureNames": [],
+            "viewSources": view_sources,
+        }
 
     def _fetch_topic_detail(self, model_id: str, topic_name: str) -> dict[str, Any]:
         """Fetch enriched topic data via the topic API. Returns {} on any error.
@@ -480,16 +768,54 @@ class ClientClass:
         except Exception:
             return {}
 
+    @staticmethod
+    def _is_shadow_workbook(
+        model: dict[str, Any],
+        document_model_ids: set[str],
+    ) -> bool:
+        """True for an unnamed WORKBOOK model that no document points at.
+
+        This is the same predicate `transformer._models` already applies when
+        deciding which models become entities, so skipping the YAML fan-out for
+        these models costs no OmniV01Model entity that v0.2.9 emits today. Their
+        topics are byte-identical copies of the SHARED parent's (which we do
+        fetch) and already dedup away in `transformer._topics`.
+        """
+        return (
+            str(model.get("modelKind") or "").upper() == "WORKBOOK"
+            and not model.get("name")
+            and str(model.get("id") or "") not in document_model_ids
+        )
+
     def fetch_snapshot(
         self,
         page_size: int = 50,
         max_pages: int | None = None,
         max_concurrency: int = 10,
+        model_kinds: Sequence[str] | None = None,
+        abort: threading.Event | None = None,
     ) -> dict[str, Any]:
+        # Cap rather than reject: an operator page_size of 500 would otherwise
+        # 400 on every listing call.
+        page_size = min(int(page_size or 50), OMNI_MAX_PAGE_SIZE)
+        self._abort = abort
         connections = self.list_connections()
         logger.info(f"fetch_snapshot: {len(connections)} connections")
 
-        models = self._collect_paginated(self.list_models, page_size, max_pages)
+        if model_kinds:
+            models = []
+            _listed_ids: set[str] = set()
+            for kind in model_kinds:
+                for row in self._collect_paginated(
+                    partial(self.list_models, model_kind=kind), page_size, max_pages
+                ):
+                    row_id = str(row.get("id") or "")
+                    if row_id and row_id in _listed_ids:
+                        continue
+                    _listed_ids.add(row_id)
+                    models.append(row)
+        else:
+            models = self._collect_paginated(self.list_models, page_size, max_pages)
         logger.info(f"fetch_snapshot: {len(models)} models listed")
 
         folders = self._collect_paginated(self.list_folders, page_size, max_pages)
@@ -498,47 +824,58 @@ class ClientClass:
         documents = self._collect_paginated(self.list_documents, page_size, max_pages)
         logger.info(f"fetch_snapshot: {len(documents)} documents listed")
 
-        # Fetch model YAMLs and document details concurrently in a shared pool.
-        # Both batches share workers; `as_completed` drives progress logging so
-        # operators can see how far along long-running tenants are.
-        topics: list[dict[str, Any]] = []
+        # Document details run FIRST: they name the models a dashboard tile
+        # actually reads, which is what lets us skip the YAML fan-out for every
+        # other unnamed workbook without dropping a tile's topic reference.
         _seen_model_ids: set[str] = set()
         document_model_ids: list[str] = []
         with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
-            model_futures = {
-                executor.submit(self._fetch_topics_for_model, m): m for m in models
-            }
             doc_futures = {
                 executor.submit(self._fetch_document_detail, d): d for d in documents
             }
-            total_models = len(model_futures)
             total_docs = len(doc_futures)
-            done_models = 0
             done_docs = 0
+            for future in as_completed(doc_futures):
+                doc = doc_futures[future]
+                detail = future.result()
+                model_id = detail.get("modelId")
+                if model_id and model_id not in _seen_model_ids:
+                    _seen_model_ids.add(model_id)
+                    document_model_ids.append(model_id)
+                doc.update(detail)
+                done_docs += 1
+                if done_docs % 10 == 0 or done_docs == total_docs:
+                    logger.info(
+                        f"fetch_snapshot progress: docs {done_docs}/{total_docs}"
+                    )
 
-            for future in as_completed({**model_futures, **doc_futures}):
-                if future in model_futures:
-                    topics.extend(future.result())
-                    done_models += 1
-                    if done_models % 5 == 0 or done_models == total_models:
-                        logger.info(
-                            f"fetch_snapshot progress: models {done_models}/{total_models}, "
-                            f"docs {done_docs}/{total_docs}, topics_so_far={len(topics)}"
-                        )
-                else:
-                    doc = doc_futures[future]
-                    detail = future.result()
-                    model_id = detail.get("modelId")
-                    if model_id and model_id not in _seen_model_ids:
-                        _seen_model_ids.add(model_id)
-                        document_model_ids.append(model_id)
-                    doc.update(detail)
-                    done_docs += 1
-                    if done_docs % 10 == 0 or done_docs == total_docs:
-                        logger.info(
-                            f"fetch_snapshot progress: models {done_models}/{total_models}, "
-                            f"docs {done_docs}/{total_docs}, topics_so_far={len(topics)}"
-                        )
+        # Every model still lands in `models` (so `_models`, `model_to_connection`
+        # and the `baseModel` edge behave exactly as before); we only skip the
+        # ~46-requests-per-model topic fetch for the shadow copies.
+        topic_models = [
+            m for m in models if not self._is_shadow_workbook(m, _seen_model_ids)
+        ]
+        logger.info(
+            f"fetch_snapshot: fetching topics for {len(topic_models)}/{len(models)} "
+            f"models ({len(models) - len(topic_models)} shadow workbooks skipped)"
+        )
+
+        topics: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+            model_futures = {
+                executor.submit(self._fetch_topics_for_model, m): m
+                for m in topic_models
+            }
+            total_models = len(model_futures)
+            done_models = 0
+            for future in as_completed(model_futures):
+                topics.extend(future.result())
+                done_models += 1
+                if done_models % 5 == 0 or done_models == total_models:
+                    logger.info(
+                        f"fetch_snapshot progress: models {done_models}/{total_models}, "
+                        f"topics_so_far={len(topics)}"
+                    )
 
         for model in models:
             model["updatedAt"] = _parse_dt(model.get("updatedAt"))
