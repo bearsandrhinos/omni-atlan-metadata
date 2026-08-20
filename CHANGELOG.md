@@ -4,7 +4,7 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-20
 
 Extraction performance and run observability, from an Atlan investigation of a
 large-tenant run that could not complete (19,937 models; ~928,000 API requests;
