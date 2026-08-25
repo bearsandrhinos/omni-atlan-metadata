@@ -46,6 +46,26 @@ class _RateLimiter:
             time.sleep(wait)
 
 
+# Rate limiting is a property of the Omni host, not of a run — five concurrent
+# activities against the same tenant sharing five 60 rpm limiters is 300 rpm
+# at Omni's door, which the API rejects. This cache hands each host a single
+# limiter that all runs against it share. Keyed on `<base_url>|<rpm>` so a
+# per-run rpm override doesn't clobber the default (paranoia: same tenant,
+# different operator-configured rpm shouldn't be a mystery).
+_HOST_RATE_LIMITERS: dict[str, _RateLimiter] = {}
+_HOST_RATE_LIMITERS_LOCK = threading.Lock()
+
+
+def _get_host_rate_limiter(base_url: str, rpm: int) -> _RateLimiter:
+    key = f"{base_url}|{rpm}"
+    with _HOST_RATE_LIMITERS_LOCK:
+        limiter = _HOST_RATE_LIMITERS.get(key)
+        if limiter is None:
+            limiter = _RateLimiter(rpm)
+            _HOST_RATE_LIMITERS[key] = limiter
+    return limiter
+
+
 def _parse_dt(value: str | None) -> str | None:
     if not value:
         return None
@@ -93,6 +113,8 @@ class ClientClass:
     ):
         self._credentials: OmniCredentials | None = None
         self._http_client: httpx.Client | None = None
+        # Placeholder until load_credentials resolves the host and swaps in the
+        # shared per-host limiter. Used only for the pre-load state.
         self._rate_limiter = _RateLimiter(rpm)
         # Set by fetch_snapshot; lets a Temporal cancellation drain the thread
         # pool instead of the pool outliving the activity (see handler).
@@ -128,10 +150,12 @@ class ClientClass:
         verify_ssl = bool(credentials.get("verify_ssl", True))
         timeout_seconds = int(credentials.get("timeout_seconds", 30))
 
-        # Reconfigure the rate limiter if the operator passed a custom rpm.
+        # Swap in the process-wide per-host limiter now that the base URL is
+        # known. All concurrent activities against the same tenant share one
+        # gate — otherwise five 60 rpm limiters is 300 rpm at Omni's door.
         rpm_raw = credentials.get("rate_limit_rpm")
-        if rpm_raw not in (None, "", 0):
-            self._rate_limiter = _RateLimiter(int(rpm_raw))
+        effective_rpm = int(rpm_raw) if rpm_raw not in (None, "", 0) else OMNI_DEFAULT_RPM
+        self._rate_limiter = _get_host_rate_limiter(base_url, effective_rpm)
         self._credentials = OmniCredentials(
             base_url=base_url,
             api_token=token,

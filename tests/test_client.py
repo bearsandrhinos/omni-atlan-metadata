@@ -37,6 +37,29 @@ def test_load_credentials_requires_protocol():
         ClientClass(credentials={"omni_base_url": "x.com/api", "omni_api_token": "t"})
 
 
+def test_rate_limiter_is_shared_across_clients_for_same_host():
+    """Item 3: throttling is a property of the Omni host, not the run. Two
+    concurrent activities against the same tenant must share one gate — five
+    per-run 60 rpm limiters is 300 rpm at Omni's door."""
+    creds = {"omni_base_url": "https://a.omniapp.co/api", "omni_api_token": "t"}
+    a = ClientClass(credentials=creds, rpm=0)
+    b = ClientClass(credentials=creds, rpm=0)
+    assert a._rate_limiter is b._rate_limiter
+
+
+def test_rate_limiter_is_distinct_across_hosts():
+    """Different tenants share a pod but not a rate quota."""
+    a = ClientClass(
+        credentials={"omni_base_url": "https://a.omniapp.co/api", "omni_api_token": "t"},
+        rpm=0,
+    )
+    b = ClientClass(
+        credentials={"omni_base_url": "https://b.omniapp.co/api", "omni_api_token": "t"},
+        rpm=0,
+    )
+    assert a._rate_limiter is not b._rate_limiter
+
+
 def test_load_credentials_accepts_wire_shape():
     # Atlan UI → Heracles sends {"host": ..., "password": ..., "authType": "apikey"}.
     # ClientClass must accept these as aliases for omni_base_url / omni_api_token.

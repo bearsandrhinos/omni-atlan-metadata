@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict
 
-from app.client import NonRetryableOmniApiError, OmniApiError
+from app.client import ClientClass, NonRetryableOmniApiError, OmniApiError
 from app.handler import HandlerClass
 from app.transformer import OmniMetadataTransformer
 from application_sdk.activities import ActivitiesInterface
@@ -189,13 +189,23 @@ class ActivitiesClass(ActivitiesInterface):
                 or resolved.get("password")
                 or resolved.get("omni_api_token")
             )
+        # Build a per-run client so credentials, HTTP client, cancel flag, etc.
+        # never leak between concurrent activities (the SDK creates one
+        # ActivitiesClass per pod and runs up to five activities concurrently
+        # — a shared self.handler.client corrupts runs and, worse, can pipe
+        # one tenant's request through another tenant's token). The rate
+        # limiter itself remains process-wide via _get_host_rate_limiter,
+        # since throttling belongs to the Omni host, not the run.
+        run_client = ClientClass(credentials=credentials)
+        run_handler = HandlerClass(client=run_client)
         try:
-            await self.handler.load(credentials=credentials)
-            snapshot = await self.handler.fetch_metadata(metadata=args["metadata"])
+            snapshot = await run_handler.fetch_metadata(metadata=args["metadata"])
         except NonRetryableOmniApiError as exc:
             raise ApplicationError(str(exc), non_retryable=True) from exc
         except OmniApiError as exc:
             raise ApplicationError(str(exc), non_retryable=not exc.retryable) from exc
+        finally:
+            run_client.close()
 
         transformer = OmniMetadataTransformer(
             connection_epoch_ms=args["metadata"]["connection_epoch_ms"],
