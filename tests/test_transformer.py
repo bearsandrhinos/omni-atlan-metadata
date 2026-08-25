@@ -185,7 +185,8 @@ def test_document_uses_source_url_and_source_updated_at():
     d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc1")
     assert d["attributes"]["sourceURL"] == "https://app.omni.co/doc1"
     assert d["attributes"]["sourceUpdatedAt"] == 1717200000000
-    assert d["attributes"]["omniV01Url"] == "https://app.omni.co/doc1"
+    # omniV01Url was a duplicate of sourceURL; not on the typedef and dropped.
+    assert "omniV01Url" not in d["attributes"]
 
 
 def test_dashboard_discriminator():
@@ -263,67 +264,90 @@ def test_scope_case_normalized():
 # Relationships (typed Atlas edges)
 # ---------------------------------------------------------------------------
 
-def test_model_has_connection_relationship():
-    mod = next(e for e in transform() if e["attributes"].get("omniV01Id") == "mod1")
-    rel = mod["relationshipAttributes"]["connection"]
-    assert rel == {
-        "typeName": "Connection",
-        "uniqueAttributes": {"qualifiedName": CONN_QN},
-    }
+def test_all_entities_carry_connection_qualified_name():
+    """`connectionQualifiedName` (inherited plain-string attr) is what Atlan
+    uses for access policies and the connection facet in discovery. There is
+    no `connection` relationship on OmniV01 types — writes with that name are
+    silently dropped."""
+    for e in transform():
+        if e["typeName"] == "Process":
+            continue  # Process has its own I/O edges, not the connection attr
+        assert e["attributes"].get("connectionQualifiedName") == CONN_QN, (
+            f"{e['typeName']} {e['attributes'].get('qualifiedName')} missing "
+            f"connectionQualifiedName"
+        )
 
 
-def test_derived_model_has_base_model_relationship():
+def test_no_entity_writes_connection_relationship():
+    """Regression fence: `connection` was written at three sites and dropped
+    silently on write. The attribute above is the only correct mechanism."""
+    for e in transform():
+        rels = e.get("relationshipAttributes") or {}
+        assert "connection" not in rels, (
+            f"{e['typeName']} {e['attributes'].get('qualifiedName')} still "
+            f"writes a `connection` relationship (Atlan drops it silently)"
+        )
+
+
+def test_derived_model_has_omniV01BaseModel_relationship():
+    """Typedef-declared key is omniV01BaseModel, not baseModel."""
     derived = next(e for e in transform() if e["attributes"].get("omniV01Id") == "mod2")
-    rel = derived["relationshipAttributes"]["baseModel"]
+    rel = derived["relationshipAttributes"]["omniV01BaseModel"]
     assert rel == {
         "typeName": "OmniV01Model",
         "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/model/mod1"},
     }
+    # Guard the old key too — Atlan drops it silently, so a regression here
+    # would be invisible in production.
+    assert "baseModel" not in derived["relationshipAttributes"]
 
 
 def test_base_model_has_no_baseModel_relationship():
     base = next(e for e in transform() if e["attributes"].get("omniV01Id") == "mod1")
-    assert "baseModel" not in base["relationshipAttributes"]
+    rels = base["relationshipAttributes"]
+    assert "omniV01BaseModel" not in rels
+    assert "baseModel" not in rels
 
 
-def test_topic_has_model_relationship():
+def test_topic_has_omniV01Model_relationship():
+    """Typedef-declared key is omniV01Model, not model."""
     orders = next(
         e for e in transform()
         if e["typeName"] == "OmniV01Topic" and e["attributes"]["omniV01Id"] == "orders"
     )
-    rel = orders["relationshipAttributes"]["model"]
+    rel = orders["relationshipAttributes"]["omniV01Model"]
     assert rel == {
         "typeName": "OmniV01Model",
         "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/model/mod1"},
     }
+    assert "model" not in orders["relationshipAttributes"]
 
 
-def test_folder_has_connection_relationship():
-    """PART-1290: folders must emit relationshipAttributes so the calculate-diff
-    step doesn't choke on a null relationshipAttributes field."""
+def test_folder_relationship_attributes_is_empty_dict_not_null():
+    """PART-1290: folders must emit an empty `relationshipAttributes` dict
+    (not omit the key) so the serializer doesn't write null and crash Atlan's
+    calculate-diff step on re-runs. Folders have no relationships on the type."""
     f = next(e for e in transform() if e["attributes"].get("omniV01Id") == "fold1")
     assert "relationshipAttributes" in f
-    assert f["relationshipAttributes"]["connection"] == {
-        "typeName": "Connection",
-        "uniqueAttributes": {"qualifiedName": CONN_QN},
-    }
+    assert f["relationshipAttributes"] == {}
 
 
-def test_document_has_connection_and_folder_relationships():
+def test_document_has_omniV01Folder_relationship():
+    """Typedef-declared key is omniV01Folder, not folder."""
     d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc1")
     rels = d["relationshipAttributes"]
-    assert rels["connection"]["uniqueAttributes"]["qualifiedName"] == CONN_QN
-    assert rels["folder"] == {
+    assert rels["omniV01Folder"] == {
         "typeName": "OmniV01Folder",
         "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/folder/fold1"},
     }
-
-
-def test_document_without_folder_still_has_connection_relationship():
-    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc2")
-    rels = d["relationshipAttributes"]
-    assert rels["connection"]["uniqueAttributes"]["qualifiedName"] == CONN_QN
     assert "folder" not in rels
+
+
+def test_document_without_folder_has_empty_relationships():
+    """Document with no folder emits `relationshipAttributes: {}` — no
+    `connection` relationship, no dangling omniV01Folder key."""
+    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc2")
+    assert d["relationshipAttributes"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -522,8 +546,8 @@ def test_workbook_inherited_topic_deduped_to_shared_qn():
     topics = [e for e in result if e["typeName"] == "OmniV01Topic"]
     assert len(topics) == 1
     assert topics[0]["attributes"]["qualifiedName"] == f"{CONN_QN}/model/shared1/topic/orders"
-    # Model relationship points at the shared model, not the workbook.
-    assert topics[0]["relationshipAttributes"]["model"]["uniqueAttributes"]["qualifiedName"] \
+    # omniV01Model relationship points at the shared model, not the workbook.
+    assert topics[0]["relationshipAttributes"]["omniV01Model"]["uniqueAttributes"]["qualifiedName"] \
         == f"{CONN_QN}/model/shared1"
 
 

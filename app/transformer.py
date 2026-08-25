@@ -180,6 +180,10 @@ class OmniMetadataTransformer:
                 "qualifiedName": qn,
                 "name": row.get("name") or model_id,
                 "connectorName": "omni",
+                # Inherited plain-string attribute — access policies key on it.
+                # There is no `connection` relationship on OmniV01 types; the
+                # Connection linkage is expressed via this attribute alone.
+                "connectionQualifiedName": self.connection_qn,
                 "omniV01Id": model_id,
                 "omniV01ModelKind": model_kind,
                 "sourceUpdatedAt": _epoch_ms(row.get("updatedAt")),
@@ -195,12 +199,13 @@ class OmniMetadataTransformer:
             if owner_users:
                 attrs["ownerUsers"] = owner_users
 
-            rel_attrs: dict[str, Any] = {
-                "connection": self._rel_ref("Connection", self.connection_qn),
-            }
+            rel_attrs: dict[str, Any] = {}
             base_model_id = row.get("baseModelId")
             if base_model_id:
-                rel_attrs["baseModel"] = self._rel_ref(
+                # Relationship name is the typedef-declared key on this side of
+                # the edge (omniV01BaseModel, not baseModel — Atlan drops
+                # unknown relationship names silently on write).
+                rel_attrs["omniV01BaseModel"] = self._rel_ref(
                     "OmniV01Model", self._model_qn(base_model_id)
                 )
 
@@ -249,6 +254,7 @@ class OmniMetadataTransformer:
                 "qualifiedName": qn,
                 "name": row.get("label") or topic_name,
                 "connectorName": "omni",
+                "connectionQualifiedName": self.connection_qn,
                 "omniV01Id": topic_name,
                 "omniV01BaseViewName": row.get("baseViewName"),
                 "sourceUpdatedAt": _epoch_ms(row.get("updatedAt")),
@@ -262,7 +268,10 @@ class OmniMetadataTransformer:
                     "typeName": "OmniV01Topic",
                     "attributes": attrs,
                     "relationshipAttributes": {
-                        "model": self._rel_ref("OmniV01Model", self._model_qn(owning)),
+                        # omniV01Model, not `model` — the typedef's declared key.
+                        "omniV01Model": self._rel_ref(
+                            "OmniV01Model", self._model_qn(owning)
+                        ),
                     },
                 }
             )
@@ -283,6 +292,7 @@ class OmniMetadataTransformer:
                 "qualifiedName": qn,
                 "name": row.get("name") or folder_id,
                 "connectorName": "omni",
+                "connectionQualifiedName": self.connection_qn,
                 "omniV01Id": folder_id,
                 "omniV01Path": row.get("path"),
             }
@@ -295,13 +305,14 @@ class OmniMetadataTransformer:
             if owner_users:
                 attrs["ownerUsers"] = owner_users
 
+            # Empty dict, not omitted: without the key the serializer writes
+            # `relationshipAttributes: null` and Atlan's calculate-diff step
+            # crashes on subsequent runs (PART-1290).
             entities.append(
                 {
                     "typeName": "OmniV01Folder",
                     "attributes": attrs,
-                    "relationshipAttributes": {
-                        "connection": self._rel_ref("Connection", self.connection_qn),
-                    },
+                    "relationshipAttributes": {},
                 }
             )
         return entities
@@ -325,9 +336,11 @@ class OmniMetadataTransformer:
                 "qualifiedName": qn,
                 "name": row.get("name") or identifier,
                 "connectorName": "omni",
+                "connectionQualifiedName": self.connection_qn,
                 "omniV01Id": identifier,
                 "omniV01DocumentType": doc_type,
-                "omniV01Url": row.get("url"),
+                # omniV01Url is not on the typedef and is dropped; sourceURL
+                # (inherited) carries the same value and renders as a link.
                 "omniV01FolderPath": folder.get("path"),
                 "sourceURL": row.get("url"),
                 "sourceUpdatedAt": _epoch_ms(row.get("updatedAt")),
@@ -344,12 +357,11 @@ class OmniMetadataTransformer:
             if owner_users:
                 attrs["ownerUsers"] = owner_users
 
-            rel_attrs: dict[str, Any] = {
-                "connection": self._rel_ref("Connection", self.connection_qn),
-            }
+            rel_attrs: dict[str, Any] = {}
             folder_id = folder.get("id")
             if folder_id:
-                rel_attrs["folder"] = self._rel_ref(
+                # omniV01Folder, not `folder` — the typedef's declared key.
+                rel_attrs["omniV01Folder"] = self._rel_ref(
                     "OmniV01Folder", self._folder_qn(folder_id)
                 )
 
