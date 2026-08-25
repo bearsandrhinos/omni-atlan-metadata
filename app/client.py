@@ -793,23 +793,31 @@ class ClientClass:
             return {}
 
     @staticmethod
-    def _is_shadow_workbook(
+    def _is_workbook_without_content(
         model: dict[str, Any],
         document_model_ids: set[str],
+        aggressive: bool = True,
     ) -> bool:
-        """True for an unnamed WORKBOOK model that no document points at.
+        """True for a WORKBOOK model no document / dashboard / app references.
 
-        This is the same predicate `transformer._models` already applies when
-        deciding which models become entities, so skipping the YAML fan-out for
-        these models costs no OmniV01Model entity that v0.2.9 emits today. Their
-        topics are byte-identical copies of the SHARED parent's (which we do
-        fetch) and already dedup away in `transformer._topics`.
+        Apps and saved workbooks both surface through `/v1/documents` (confirmed
+        with the customer), so `document_model_ids` is the complete content
+        set — a workbook model absent from it is an ephemeral session Omni
+        auto-creates when a user opens a workbook. On a large tenant these
+        outnumber real workbooks by roughly two orders of magnitude.
+
+        `aggressive` is the config-flag escape hatch. When True (default),
+        catches every content-less workbook, named or not. When False, only
+        UNNAMED ones — the pre-fix v0.3.0 behaviour, kept for the rare tenant
+        whose named workbooks legitimately aren't in the document set.
         """
-        return (
-            str(model.get("modelKind") or "").upper() == "WORKBOOK"
-            and not model.get("name")
-            and str(model.get("id") or "") not in document_model_ids
-        )
+        if str(model.get("modelKind") or "").upper() != "WORKBOOK":
+            return False
+        if str(model.get("id") or "") in document_model_ids:
+            return False
+        if not aggressive and model.get("name"):
+            return False
+        return True
 
     def fetch_snapshot(
         self,
@@ -817,6 +825,7 @@ class ClientClass:
         max_pages: int | None = None,
         max_concurrency: int = 10,
         model_kinds: Sequence[str] | None = None,
+        crawl_only_content_backed_workbooks: bool = True,
         abort: threading.Event | None = None,
     ) -> dict[str, Any]:
         # Cap rather than reject: an operator page_size of 500 would otherwise
@@ -873,15 +882,20 @@ class ClientClass:
                         f"fetch_snapshot progress: docs {done_docs}/{total_docs}"
                     )
 
-        # Every model still lands in `models` (so `_models`, `model_to_connection`
-        # and the `baseModel` edge behave exactly as before); we only skip the
-        # ~46-requests-per-model topic fetch for the shadow copies.
+        # Drop content-less workbook models before the YAML fan-out. Every
+        # model still lands in `models` (so `model_to_connection` and the
+        # `omniV01BaseModel` edge behave exactly as before); the transformer
+        # is the second gate that keeps content-less workbook ENTITIES out of
+        # the catalog. Both gates share the same predicate for consistency.
         topic_models = [
-            m for m in models if not self._is_shadow_workbook(m, _seen_model_ids)
+            m for m in models
+            if not self._is_workbook_without_content(
+                m, _seen_model_ids, aggressive=crawl_only_content_backed_workbooks,
+            )
         ]
         logger.info(
             f"fetch_snapshot: fetching topics for {len(topic_models)}/{len(models)} "
-            f"models ({len(models) - len(topic_models)} shadow workbooks skipped)"
+            f"models ({len(models) - len(topic_models)} content-less workbooks skipped)"
         )
 
         topics: list[dict[str, Any]] = []
@@ -918,4 +932,9 @@ class ClientClass:
             "documents": documents,
             "topics": topics,
             "document_model_ids": document_model_ids,
+            # Threaded to the transformer so its entity filter matches the
+            # client's YAML pre-filter. Without this the transformer would
+            # emit OmniV01Model entities for workbooks whose topics we
+            # deliberately never fetched.
+            "crawl_only_content_backed_workbooks": crawl_only_content_backed_workbooks,
         }

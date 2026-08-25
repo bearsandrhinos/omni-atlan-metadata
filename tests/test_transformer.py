@@ -87,7 +87,9 @@ SNAPSHOT = {
             "tileTopics": [],
         },
     ],
-    "document_model_ids": [],
+    # mod2 (WORKBOOK) is content-backed in this fixture — the item 4a filter
+    # otherwise drops it, since a workbook not in /v1/documents is ephemeral.
+    "document_model_ids": ["mod2"],
 }
 
 
@@ -321,6 +323,55 @@ def test_topic_has_omniV01Model_relationship():
         "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/model/mod1"},
     }
     assert "model" not in orders["relationshipAttributes"]
+
+
+# ---------------------------------------------------------------------------
+# Item 4a — content-less workbook filter
+# ---------------------------------------------------------------------------
+
+def _workbook_filter_snapshot(name: str | None, in_documents: bool):
+    """Snapshot with one WORKBOOK model whose content association we control."""
+    doc_ids = ["wb1"] if in_documents else []
+    return {
+        "connections": [],
+        "models": [{"id": "wb1", "name": name, "modelKind": "WORKBOOK"}],
+        "topics": [],
+        "folders": [],
+        "documents": [],
+        "document_model_ids": doc_ids,
+    }
+
+
+def test_workbook_backed_by_document_is_kept():
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(
+        _workbook_filter_snapshot(name="Real WB", in_documents=True)
+    )
+    assert any(e["typeName"] == "OmniV01Model" for e in result)
+
+
+def test_named_workbook_without_content_is_dropped_by_default():
+    """Aggressive filter (default): named workbook not in /v1/documents is
+    an ephemeral session that happens to have a name — drop it."""
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(
+        _workbook_filter_snapshot(name="Ephemeral", in_documents=False)
+    )
+    assert not any(e["typeName"] == "OmniV01Model" for e in result)
+
+
+def test_unnamed_workbook_without_content_is_dropped():
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(
+        _workbook_filter_snapshot(name=None, in_documents=False)
+    )
+    assert not any(e["typeName"] == "OmniV01Model" for e in result)
+
+
+def test_named_workbook_kept_when_escape_hatch_off():
+    """Escape hatch: `crawl_only_content_backed_workbooks=false` restores the
+    pre-fix behaviour of keeping named workbooks even without documents."""
+    snap = _workbook_filter_snapshot(name="Manually curated", in_documents=False)
+    snap["crawl_only_content_backed_workbooks"] = False
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(snap)
+    assert any(e["typeName"] == "OmniV01Model" for e in result)
 
 
 def test_folder_relationship_attributes_is_empty_dict_not_null():

@@ -72,6 +72,12 @@ class OmniMetadataTransformer:
         models = snapshot.get("models", [])
         topics = snapshot.get("topics", [])
         folders = snapshot.get("folders", [])
+        # Default to `True` (aggressive) to match `client.fetch_snapshot`'s
+        # default, so a snapshot built by an older client without the flag
+        # still gets the correct entity filter.
+        aggressive_workbook_filter = bool(
+            snapshot.get("crawl_only_content_backed_workbooks", True)
+        )
 
         # Lookups for source-table lineage resolution.
         model_to_connection: dict[str, str] = {
@@ -98,7 +104,9 @@ class OmniMetadataTransformer:
         }
 
         entities: list[dict[str, Any]] = []
-        entities.extend(self._models(models, document_model_ids))
+        entities.extend(
+            self._models(models, document_model_ids, aggressive_workbook_filter)
+        )
         entities.extend(self._topics(topics))
         entities.extend(self._folders(folders))
         entities.extend(self._documents(documents))
@@ -156,7 +164,9 @@ class OmniMetadataTransformer:
         self,
         records: list[dict[str, Any]],
         document_model_ids: list[str] | None = None,
+        aggressive_workbook_filter: bool = True,
     ) -> list[dict[str, Any]]:
+        content_backed_ids = set(document_model_ids or [])
         entities: list[dict[str, Any]] = []
         for row in records:
             model_id = row.get("id")
@@ -164,9 +174,11 @@ class OmniMetadataTransformer:
                 continue
             if row.get("modelKind") == "SCHEMA":
                 continue
-            # Exclude unnamed WORKBOOK models that aren't backing a document.
-            if row.get("modelKind") == "WORKBOOK" and not row.get("name"):
-                if document_model_ids is None or model_id not in document_model_ids:
+            # Drop content-less WORKBOOK models. Must match client.fetch_snapshot's
+            # YAML pre-filter — otherwise we'd emit OmniV01Model entities for
+            # workbooks whose topics were never fetched.
+            if row.get("modelKind") == "WORKBOOK" and model_id not in content_backed_ids:
+                if aggressive_workbook_filter or not row.get("name"):
                     continue
 
             model_kind = self._normalize_enum(row.get("modelKind"), _MODEL_KINDS)

@@ -128,6 +128,14 @@ class ActivitiesClass(ActivitiesInterface):
         if os.environ.get("OMNI_LOCAL_UI", "").lower() in ("1", "true", "yes"):
             save_output_raw = True
 
+        # Escape hatch: `crawl_only_content_backed_workbooks=false` restores the
+        # v0.3.0 behaviour of crawling every workbook, named or not. Default
+        # True — the aggressive filter (drop WORKBOOK models absent from
+        # /v1/documents) cuts ~90% of API traffic on tenants like the one
+        # with 19,937 models where most are ephemeral sessions.
+        aggressive_raw = _form_value("crawl_only_content_backed_workbooks")
+        aggressive_workbook_filter = True if aggressive_raw is None else bool(aggressive_raw)
+
         metadata: dict[str, Any] = {
             "page_size": _to_int(page_size_raw, 100),
             "max_pages": _to_int(max_pages_raw, None),
@@ -136,6 +144,7 @@ class ActivitiesClass(ActivitiesInterface):
             "save_output_local": False if save_output_raw is None else bool(save_output_raw),
             "max_concurrency": _to_int(max_concurrency_raw, 10),
             "atlan_source_connection_map": atlan_source_connection_map,
+            "crawl_only_content_backed_workbooks": aggressive_workbook_filter,
         }
 
         credentials = {

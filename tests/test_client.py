@@ -606,7 +606,7 @@ def test_workbook_inherited_topic_owning_is_shared_model():
         return_value=httpx.Response(404)
     )
 
-    snapshot = make_client().fetch_snapshot()
+    snapshot = make_client().fetch_snapshot(crawl_only_content_backed_workbooks=False)
     topics_by_model = {t["modelId"]: t for t in snapshot["topics"]}
     assert topics_by_model["shared1"]["owningModelId"] == "shared1"
     assert topics_by_model["wb1"]["owningModelId"] == "shared1"
@@ -652,7 +652,7 @@ def test_workbook_overridden_topic_owning_is_workbook():
         return_value=httpx.Response(404)
     )
 
-    snapshot = make_client().fetch_snapshot()
+    snapshot = make_client().fetch_snapshot(crawl_only_content_backed_workbooks=False)
     topics_by_model = {t["modelId"]: t for t in snapshot["topics"]}
     assert topics_by_model["shared1"]["owningModelId"] == "shared1"
     assert topics_by_model["wb1"]["owningModelId"] == "wb1"
@@ -690,7 +690,7 @@ def test_workbook_extension_fetch_failure_keeps_workbook_owning():
         return_value=httpx.Response(404)
     )
 
-    snapshot = make_client().fetch_snapshot()
+    snapshot = make_client().fetch_snapshot(crawl_only_content_backed_workbooks=False)
     assert snapshot["topics"][0]["owningModelId"] == "wb1"
 
 
