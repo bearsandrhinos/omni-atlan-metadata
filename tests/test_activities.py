@@ -347,17 +347,37 @@ def _contains_value(obj, needle: str) -> bool:
     return False
 
 
-async def _call_extract(args: dict, handler) -> dict:
+async def _call_extract(args: dict, client_factory=None, run_handler_factory=None) -> tuple[dict, MagicMock]:
+    """Run the extract activity against mocked client + handler + writer.
+
+    Returns (activity_result, client_ctor_mock) so callers can inspect what
+    credentials were handed to ClientClass. The extract path builds a per-run
+    ClientClass and HandlerClass inside the activity, so patching them at the
+    module-level import site is how we hook the seam.
+    """
     from app.activities import ActivitiesClass
 
-    activities = ActivitiesClass(handler=handler)
+    activities = ActivitiesClass()
+
+    # Per-run client and handler constructed inside the activity — patch both.
+    client_ctor = MagicMock(return_value=MagicMock(close=MagicMock()))
+    handler_instance = MagicMock()
+    handler_instance.fetch_metadata = AsyncMock(return_value=EMPTY_SNAPSHOT)
+    handler_ctor = MagicMock(return_value=handler_instance)
+
     writer = MagicMock()
     writer.write = AsyncMock()
     stats = MagicMock()
     stats.total_record_count = 0
     writer.close = AsyncMock(return_value=stats)
-    with patch("app.activities.JsonFileWriter", return_value=writer):
-        return await activities.extract_and_transform_metadata(args)
+
+    with (
+        patch("app.activities.ClientClass", new=client_ctor),
+        patch("app.activities.HandlerClass", new=handler_ctor),
+        patch("app.activities.JsonFileWriter", return_value=writer),
+    ):
+        result = await activities.extract_and_transform_metadata(args)
+    return result, client_ctor
 
 
 def _make_extract_args(overrides: dict | None = None) -> dict:
@@ -409,15 +429,13 @@ async def test_extract_resolves_credentials_from_guid():
     args = _make_extract_args(
         {"credential_guid": "b8b7ec20-ee9c-4ffc-8ddd-86c7809e1074"}
     )
-    handler = MagicMock()
-    handler.load = AsyncMock()
-    handler.fetch_metadata = AsyncMock(return_value=EMPTY_SNAPSHOT)
     with patch(
         "app.activities.SecretStore.get_credentials",
         new=AsyncMock(return_value=RESOLVED_CREDENTIAL),
     ):
-        result = await _call_extract(args, handler)
-    loaded = handler.load.await_args.kwargs["credentials"]
+        result, client_ctor = await _call_extract(args)
+    # ClientClass is constructed inside the activity with the resolved creds.
+    loaded = client_ctor.call_args.kwargs["credentials"]
     assert loaded["omni_base_url"] == "https://partneratlan.omniapp.co/api"
     assert loaded["omni_api_token"] == "tok-secret"
     assert loaded["verify_ssl"] is True
@@ -433,14 +451,11 @@ async def test_extract_inline_credentials_skip_secretstore():
     )
     args["credentials"]["omni_base_url"] = "https://org.omniapp.co/api"
     args["credentials"]["omni_api_token"] = "tok-inline"
-    handler = MagicMock()
-    handler.load = AsyncMock()
-    handler.fetch_metadata = AsyncMock(return_value=EMPTY_SNAPSHOT)
     mock = AsyncMock()
     with patch("app.activities.SecretStore.get_credentials", new=mock):
-        await _call_extract(args, handler)
+        _, client_ctor = await _call_extract(args)
     mock.assert_not_awaited()
-    loaded = handler.load.await_args.kwargs["credentials"]
+    loaded = client_ctor.call_args.kwargs["credentials"]
     assert loaded["omni_api_token"] == "tok-inline"
 
 
@@ -449,12 +464,22 @@ async def test_extract_no_guid_passes_credentials_through():
     args = _make_extract_args()
     args["credentials"]["omni_base_url"] = "https://org.omniapp.co/api"
     args["credentials"]["omni_api_token"] = "tok-local"
-    handler = MagicMock()
-    handler.load = AsyncMock()
-    handler.fetch_metadata = AsyncMock(return_value=EMPTY_SNAPSHOT)
     mock = AsyncMock()
     with patch("app.activities.SecretStore.get_credentials", new=mock):
-        await _call_extract(args, handler)
+        _, client_ctor = await _call_extract(args)
     mock.assert_not_awaited()
-    loaded = handler.load.await_args.kwargs["credentials"]
+    loaded = client_ctor.call_args.kwargs["credentials"]
     assert loaded["omni_base_url"] == "https://org.omniapp.co/api"
+
+
+@pytest.mark.asyncio
+async def test_extract_uses_per_run_client_and_closes_it():
+    """Item 3 (multi-run corruption): the extract activity must construct its
+    own ClientClass and close it in a finally, not reuse activities.self.handler."""
+    args = _make_extract_args()
+    args["credentials"]["omni_base_url"] = "https://org.omniapp.co/api"
+    args["credentials"]["omni_api_token"] = "tok"
+    with patch("app.activities.SecretStore.get_credentials", new=AsyncMock()):
+        _, client_ctor = await _call_extract(args)
+    client_ctor.assert_called_once()
+    client_ctor.return_value.close.assert_called_once()

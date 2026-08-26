@@ -50,6 +50,13 @@ class HandlerClass(HandlerInterface):
         max_pages = int(max_pages) if max_pages not in (None, "", "null") else None
         max_concurrency = int(metadata.get("max_concurrency", 10))
         model_kinds = metadata.get("model_kinds") or None
+        # Default True: on a large tenant most WORKBOOK models are ephemeral
+        # sessions Omni auto-creates and are not worth crawling. Escape hatch
+        # is the config flag `crawl_only_content_backed_workbooks=false`.
+        raw_flag = metadata.get("crawl_only_content_backed_workbooks")
+        crawl_only_content_backed_workbooks = (
+            True if raw_flag is None else bool(raw_flag)
+        )
         # fetch_snapshot is synchronous and blocks for hours on a large tenant.
         # Calling it directly wedged the worker's event loop, so the activity's
         # own heartbeat could not fire and the worker never observed its
@@ -64,6 +71,7 @@ class HandlerClass(HandlerInterface):
                 max_pages=max_pages,
                 max_concurrency=max_concurrency,
                 model_kinds=model_kinds,
+                crawl_only_content_backed_workbooks=crawl_only_content_backed_workbooks,
                 abort=abort,
             )
         except asyncio.CancelledError:

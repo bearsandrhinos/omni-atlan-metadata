@@ -87,7 +87,9 @@ SNAPSHOT = {
             "tileTopics": [],
         },
     ],
-    "document_model_ids": [],
+    # mod2 (WORKBOOK) is content-backed in this fixture — the item 4a filter
+    # otherwise drops it, since a workbook not in /v1/documents is ephemeral.
+    "document_model_ids": ["mod2"],
 }
 
 
@@ -123,6 +125,59 @@ def test_type_name_counts():
 def test_no_connection_entity_emitted():
     """omni_connection retired; connector references built-in Connection via relationship edge."""
     assert not any(e["typeName"] == "Connection" for e in transform())
+
+
+# ---------------------------------------------------------------------------
+# Item 6 — _epoch_ms robustness (one bad date must not fail the whole crawl)
+# ---------------------------------------------------------------------------
+
+def test_epoch_ms_returns_none_on_garbage_string():
+    """Item 6: an unparseable value returns None, not a crash. With
+    maximum_attempts=1 in workflow.py, a raise here loses three hours of work."""
+    from app.transformer import _epoch_ms
+    assert _epoch_ms("not-a-date") is None
+
+
+def test_epoch_ms_returns_none_on_non_string():
+    """str(value) inside _epoch_ms handles int/list/None-with-str-cast paths."""
+    from app.transformer import _epoch_ms
+    assert _epoch_ms(12345) is None  # int is not ISO-8601
+    assert _epoch_ms(None) is None
+    assert _epoch_ms("") is None
+
+
+def test_epoch_ms_naive_datetime_treated_as_utc():
+    """A naive datetime string (no tz) is currently read in the container's
+    local zone — pods run in various regions. Force UTC so timestamps don't
+    drift by the pod's offset."""
+    from app.transformer import _epoch_ms
+    # 2024-01-01T00:00:00Z == 1704067200000 ms
+    assert _epoch_ms("2024-01-01T00:00:00") == 1704067200000
+
+
+def test_epoch_ms_iso_with_tz_unchanged():
+    from app.transformer import _epoch_ms
+    assert _epoch_ms("2024-01-01T00:00:00+00:00") == 1704067200000
+
+
+def test_atlan_source_connection_map_strips_trailing_slash():
+    """Operator-pasted paths often have a trailing slash; the resulting
+    double-slash in the table qualifiedName gets rejected by Atlan."""
+    t = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        atlan_source_connection_map={"conn1": "default/snowflake/1700000000/  "},
+    )
+    assert t.atlan_source_connection_map["conn1"] == "default/snowflake/1700000000"
+
+
+def test_atlan_source_connection_map_preserves_case():
+    """Atlan warehouse qualifiedNames are case-sensitive (Snowflake uppercases,
+    Postgres does not) — the strip must not fold case."""
+    t = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        atlan_source_connection_map={"c1": "default/Snowflake/ID/"},
+    )
+    assert t.atlan_source_connection_map["c1"] == "default/Snowflake/ID"
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +240,8 @@ def test_document_uses_source_url_and_source_updated_at():
     d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc1")
     assert d["attributes"]["sourceURL"] == "https://app.omni.co/doc1"
     assert d["attributes"]["sourceUpdatedAt"] == 1717200000000
-    assert d["attributes"]["omniV01Url"] == "https://app.omni.co/doc1"
+    # omniV01Url was a duplicate of sourceURL; not on the typedef and dropped.
+    assert "omniV01Url" not in d["attributes"]
 
 
 def test_dashboard_discriminator():
@@ -263,67 +319,139 @@ def test_scope_case_normalized():
 # Relationships (typed Atlas edges)
 # ---------------------------------------------------------------------------
 
-def test_model_has_connection_relationship():
-    mod = next(e for e in transform() if e["attributes"].get("omniV01Id") == "mod1")
-    rel = mod["relationshipAttributes"]["connection"]
-    assert rel == {
-        "typeName": "Connection",
-        "uniqueAttributes": {"qualifiedName": CONN_QN},
-    }
+def test_all_entities_carry_connection_qualified_name():
+    """`connectionQualifiedName` (inherited plain-string attr) is what Atlan
+    uses for access policies and the connection facet in discovery. There is
+    no `connection` relationship on OmniV01 types — writes with that name are
+    silently dropped."""
+    for e in transform():
+        if e["typeName"] == "Process":
+            continue  # Process has its own I/O edges, not the connection attr
+        assert e["attributes"].get("connectionQualifiedName") == CONN_QN, (
+            f"{e['typeName']} {e['attributes'].get('qualifiedName')} missing "
+            f"connectionQualifiedName"
+        )
 
 
-def test_derived_model_has_base_model_relationship():
+def test_no_entity_writes_connection_relationship():
+    """Regression fence: `connection` was written at three sites and dropped
+    silently on write. The attribute above is the only correct mechanism."""
+    for e in transform():
+        rels = e.get("relationshipAttributes") or {}
+        assert "connection" not in rels, (
+            f"{e['typeName']} {e['attributes'].get('qualifiedName')} still "
+            f"writes a `connection` relationship (Atlan drops it silently)"
+        )
+
+
+def test_derived_model_has_omniV01BaseModel_relationship():
+    """Typedef-declared key is omniV01BaseModel, not baseModel."""
     derived = next(e for e in transform() if e["attributes"].get("omniV01Id") == "mod2")
-    rel = derived["relationshipAttributes"]["baseModel"]
+    rel = derived["relationshipAttributes"]["omniV01BaseModel"]
     assert rel == {
         "typeName": "OmniV01Model",
         "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/model/mod1"},
     }
+    # Guard the old key too — Atlan drops it silently, so a regression here
+    # would be invisible in production.
+    assert "baseModel" not in derived["relationshipAttributes"]
 
 
 def test_base_model_has_no_baseModel_relationship():
     base = next(e for e in transform() if e["attributes"].get("omniV01Id") == "mod1")
-    assert "baseModel" not in base["relationshipAttributes"]
+    rels = base["relationshipAttributes"]
+    assert "omniV01BaseModel" not in rels
+    assert "baseModel" not in rels
 
 
-def test_topic_has_model_relationship():
+def test_topic_has_omniV01Model_relationship():
+    """Typedef-declared key is omniV01Model, not model."""
     orders = next(
         e for e in transform()
         if e["typeName"] == "OmniV01Topic" and e["attributes"]["omniV01Id"] == "orders"
     )
-    rel = orders["relationshipAttributes"]["model"]
+    rel = orders["relationshipAttributes"]["omniV01Model"]
     assert rel == {
         "typeName": "OmniV01Model",
         "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/model/mod1"},
     }
+    assert "model" not in orders["relationshipAttributes"]
 
 
-def test_folder_has_connection_relationship():
-    """PART-1290: folders must emit relationshipAttributes so the calculate-diff
-    step doesn't choke on a null relationshipAttributes field."""
-    f = next(e for e in transform() if e["attributes"].get("omniV01Id") == "fold1")
-    assert "relationshipAttributes" in f
-    assert f["relationshipAttributes"]["connection"] == {
-        "typeName": "Connection",
-        "uniqueAttributes": {"qualifiedName": CONN_QN},
+# ---------------------------------------------------------------------------
+# Item 4a — content-less workbook filter
+# ---------------------------------------------------------------------------
+
+def _workbook_filter_snapshot(name: str | None, in_documents: bool):
+    """Snapshot with one WORKBOOK model whose content association we control."""
+    doc_ids = ["wb1"] if in_documents else []
+    return {
+        "connections": [],
+        "models": [{"id": "wb1", "name": name, "modelKind": "WORKBOOK"}],
+        "topics": [],
+        "folders": [],
+        "documents": [],
+        "document_model_ids": doc_ids,
     }
 
 
-def test_document_has_connection_and_folder_relationships():
+def test_workbook_backed_by_document_is_kept():
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(
+        _workbook_filter_snapshot(name="Real WB", in_documents=True)
+    )
+    assert any(e["typeName"] == "OmniV01Model" for e in result)
+
+
+def test_named_workbook_without_content_is_dropped_by_default():
+    """Aggressive filter (default): named workbook not in /v1/documents is
+    an ephemeral session that happens to have a name — drop it."""
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(
+        _workbook_filter_snapshot(name="Ephemeral", in_documents=False)
+    )
+    assert not any(e["typeName"] == "OmniV01Model" for e in result)
+
+
+def test_unnamed_workbook_without_content_is_dropped():
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(
+        _workbook_filter_snapshot(name=None, in_documents=False)
+    )
+    assert not any(e["typeName"] == "OmniV01Model" for e in result)
+
+
+def test_named_workbook_kept_when_escape_hatch_off():
+    """Escape hatch: `crawl_only_content_backed_workbooks=false` restores the
+    pre-fix behaviour of keeping named workbooks even without documents."""
+    snap = _workbook_filter_snapshot(name="Manually curated", in_documents=False)
+    snap["crawl_only_content_backed_workbooks"] = False
+    result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(snap)
+    assert any(e["typeName"] == "OmniV01Model" for e in result)
+
+
+def test_folder_relationship_attributes_is_empty_dict_not_null():
+    """PART-1290: folders must emit an empty `relationshipAttributes` dict
+    (not omit the key) so the serializer doesn't write null and crash Atlan's
+    calculate-diff step on re-runs. Folders have no relationships on the type."""
+    f = next(e for e in transform() if e["attributes"].get("omniV01Id") == "fold1")
+    assert "relationshipAttributes" in f
+    assert f["relationshipAttributes"] == {}
+
+
+def test_document_has_omniV01Folder_relationship():
+    """Typedef-declared key is omniV01Folder, not folder."""
     d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc1")
     rels = d["relationshipAttributes"]
-    assert rels["connection"]["uniqueAttributes"]["qualifiedName"] == CONN_QN
-    assert rels["folder"] == {
+    assert rels["omniV01Folder"] == {
         "typeName": "OmniV01Folder",
         "uniqueAttributes": {"qualifiedName": f"{CONN_QN}/folder/fold1"},
     }
-
-
-def test_document_without_folder_still_has_connection_relationship():
-    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc2")
-    rels = d["relationshipAttributes"]
-    assert rels["connection"]["uniqueAttributes"]["qualifiedName"] == CONN_QN
     assert "folder" not in rels
+
+
+def test_document_without_folder_has_empty_relationships():
+    """Document with no folder emits `relationshipAttributes: {}` — no
+    `connection` relationship, no dangling omniV01Folder key."""
+    d = next(e for e in transform() if e["attributes"].get("omniV01Id") == "doc2")
+    assert d["relationshipAttributes"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +639,10 @@ def _wb_snapshot(overridden: bool) -> dict:
             {"identifier": "doc1", "name": "Rev", "hasDashboard": True,
              "tileTopics": [{"modelId": "wb1", "topicName": "orders"}]},
         ],
-        "document_model_ids": [],
+        # Item 4a's aggressive filter would otherwise drop wb1 as a content-less
+        # workbook. This fixture is exercising the canonicalization logic on a
+        # workbook that IS content-backed (doc1 tiles into it).
+        "document_model_ids": ["wb1"],
     }
 
 
@@ -522,8 +653,8 @@ def test_workbook_inherited_topic_deduped_to_shared_qn():
     topics = [e for e in result if e["typeName"] == "OmniV01Topic"]
     assert len(topics) == 1
     assert topics[0]["attributes"]["qualifiedName"] == f"{CONN_QN}/model/shared1/topic/orders"
-    # Model relationship points at the shared model, not the workbook.
-    assert topics[0]["relationshipAttributes"]["model"]["uniqueAttributes"]["qualifiedName"] \
+    # omniV01Model relationship points at the shared model, not the workbook.
+    assert topics[0]["relationshipAttributes"]["omniV01Model"]["uniqueAttributes"]["qualifiedName"] \
         == f"{CONN_QN}/model/shared1"
 
 
@@ -573,22 +704,22 @@ def test_source_process_deduped_to_shared_topic():
         == f"{CONN_QN}/model/shared1/topic/orders"
 
 
-def test_tile_topic_uncatalogued_falls_back_to_raw_model_id():
-    """If the tile references a topic we never enumerated (filtered/absent from
-    the snapshot), the Process still emits using the raw model_id — no crash."""
+def test_tile_topic_uncatalogued_is_skipped_not_backfilled():
+    """PART-1355 item 2 case 4: a tile referencing a topic the crawl never
+    enumerated (filtered / partial fetch) must NOT emit a Process. The
+    fallback-to-raw-model_id path Atlan flagged was creating dangling
+    references that ATLAS-404'd the whole publish."""
     snap = {
         "connections": [],
-        "models": [{"id": "wb1", "name": "WB", "modelKind": "SHARED"}],
+        "models": [{"id": "shared1", "name": "S", "modelKind": "SHARED"}],
         "topics": [],  # no topic enumerated
         "folders": [],
         "documents": [
             {"identifier": "d1", "name": "D", "hasDashboard": True,
-             "tileTopics": [{"modelId": "wb1", "topicName": "unknown"}]},
+             "tileTopics": [{"modelId": "shared1", "topicName": "unknown"}]},
         ],
         "document_model_ids": [],
     }
     result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(snap)
     procs = [e for e in result if e["typeName"] == "Process"]
-    assert len(procs) == 1
-    assert procs[0]["attributes"]["qualifiedName"] \
-        == f"{CONN_QN}/process/topic/wb1/unknown/document/d1"
+    assert procs == []

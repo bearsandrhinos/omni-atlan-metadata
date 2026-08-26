@@ -46,13 +46,39 @@ class _RateLimiter:
             time.sleep(wait)
 
 
-def _parse_dt(value: str | None) -> str | None:
+# Rate limiting is a property of the Omni host, not of a run — five concurrent
+# activities against the same tenant sharing five 60 rpm limiters is 300 rpm
+# at Omni's door, which the API rejects. This cache hands each host a single
+# limiter that all runs against it share. Keyed on `<base_url>|<rpm>` so a
+# per-run rpm override doesn't clobber the default (paranoia: same tenant,
+# different operator-configured rpm shouldn't be a mystery).
+_HOST_RATE_LIMITERS: dict[str, _RateLimiter] = {}
+_HOST_RATE_LIMITERS_LOCK = threading.Lock()
+
+
+def _get_host_rate_limiter(base_url: str, rpm: int) -> _RateLimiter:
+    key = f"{base_url}|{rpm}"
+    with _HOST_RATE_LIMITERS_LOCK:
+        limiter = _HOST_RATE_LIMITERS.get(key)
+        if limiter is None:
+            limiter = _RateLimiter(rpm)
+            _HOST_RATE_LIMITERS[key] = limiter
+    return limiter
+
+
+def _parse_dt(value: Any) -> str | None:
+    """Normalise an ISO-8601 string to canonical isoformat.
+
+    Returns None on parse failure so the bad value never reaches the
+    transformer's _epoch_ms (which would otherwise raise and take down
+    the whole run — see PART-1079 rev 2 in the Atlan review).
+    """
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat()
-    except ValueError:
-        return value
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).isoformat()
+    except (ValueError, TypeError):
+        return None
 
 
 @dataclass
@@ -85,6 +111,25 @@ class NonRetryableOmniApiError(OmniApiError):
     pass
 
 
+# Per-run tallies of silently-swallowed errors, grouped by blast radius.
+# One model-YAML failure loses that whole model's topics; one topic-detail
+# failure loses one topic's enrichment; one document-detail failure loses one
+# doc's tile-topic edges. Emitting these blended into one pooled ratio hides
+# whichever is dominating, so each category is counted separately.
+_FAILURE_CATEGORIES = (
+    "model_yaml",
+    "override_probe",
+    "topic_detail",
+    "document_detail",
+)
+
+# If more than this fraction of model-YAML fetches fail, abort after the
+# model pass — before we spend three hours on a run whose topic side will
+# be inconsistent anyway. Checked in fetch_snapshot with maximum_attempts=1
+# in mind: a late abort costs a full re-crawl.
+_MODEL_YAML_FAILURE_ABORT_THRESHOLD = 0.20
+
+
 class ClientClass:
     def __init__(
         self,
@@ -93,12 +138,28 @@ class ClientClass:
     ):
         self._credentials: OmniCredentials | None = None
         self._http_client: httpx.Client | None = None
+        # Placeholder until load_credentials resolves the host and swaps in the
+        # shared per-host limiter. Used only for the pre-load state.
         self._rate_limiter = _RateLimiter(rpm)
         # Set by fetch_snapshot; lets a Temporal cancellation drain the thread
         # pool instead of the pool outliving the activity (see handler).
         self._abort: threading.Event | None = None
+        # Per-run failure tallies. Reset at fetch_snapshot start.
+        self._failures: dict[str, int] = {k: 0 for k in _FAILURE_CATEGORIES}
         if credentials:
             self.load_credentials(credentials)
+
+    def _swallow(self, category: str, context: str, exc: BaseException) -> None:
+        """Record + log a silently-caught error so it isn't invisible.
+
+        The bare `except Exception: return {}` pattern was correct in intent
+        (one bad topic shouldn't fail the crawl) but wrong in execution:
+        with no counter and no log, the 29-minute run that lost 88% of its
+        topics still reported success. Callers still swallow; this method
+        just makes the swallow observable.
+        """
+        self._failures[category] = self._failures.get(category, 0) + 1
+        logger.warning(f"omni fetch failure ({category}) {context}: {exc!r}")
 
     def load_credentials(self, credentials: dict[str, Any]) -> None:
         # Accept both credential shapes:
@@ -128,10 +189,12 @@ class ClientClass:
         verify_ssl = bool(credentials.get("verify_ssl", True))
         timeout_seconds = int(credentials.get("timeout_seconds", 30))
 
-        # Reconfigure the rate limiter if the operator passed a custom rpm.
+        # Swap in the process-wide per-host limiter now that the base URL is
+        # known. All concurrent activities against the same tenant share one
+        # gate — otherwise five 60 rpm limiters is 300 rpm at Omni's door.
         rpm_raw = credentials.get("rate_limit_rpm")
-        if rpm_raw not in (None, "", 0):
-            self._rate_limiter = _RateLimiter(int(rpm_raw))
+        effective_rpm = int(rpm_raw) if rpm_raw not in (None, "", 0) else OMNI_DEFAULT_RPM
+        self._rate_limiter = _get_host_rate_limiter(base_url, effective_rpm)
         self._credentials = OmniCredentials(
             base_url=base_url,
             api_token=token,
@@ -186,6 +249,18 @@ class ClientClass:
                 ) from exc
 
             status = response.status_code
+            if 300 <= status < 400:
+                # A 3xx from Omni's API almost always means the base URL is
+                # wrong (typically missing the `/api` suffix — the marketing
+                # site 302s to docs). Fail loud with the target URL so the
+                # operator gets a useful message rather than a JSONDecodeError.
+                location = response.headers.get("location") or "(no Location header)"
+                raise NonRetryableOmniApiError(
+                    f"GET {path} redirected ({status} -> {location}). Check "
+                    f"omni_base_url — Omni's REST API lives under `/api`.",
+                    status_code=status,
+                    retryable=False,
+                )
             if status < 400:
                 data = response.json()
                 if not isinstance(data, dict):
@@ -327,6 +402,38 @@ class ClientClass:
                 break
         return rows
 
+    def _walk_to_shared_owner(self, model_id: str) -> str:
+        """Climb baseModelId until we hit a SHARED ancestor.
+
+        Real Omni inheritance is deeper than one hop: schema -> shared ->
+        extension/branch -> workbook. v0.3.0 canonicalized one level up, so an
+        inherited topic still emitted a copy for every intermediate layer.
+        On the customer's tenant this produced ~493 copies of the same topic.
+
+        Also handles the SHARED_EXTENSION / BRANCH case: those kinds are not
+        representable as OmniV01Model, so climbing past them lands on the
+        SHARED ancestor that IS representable.
+
+        Falls back to `model_id` if the chain doesn't reach a SHARED (chain
+        broken, or terminates in a non-SHARED). The referential-closure gate
+        will flag any dangling relationship this creates.
+        """
+        lookup = getattr(self, "_model_lookup", None) or {}
+        seen: set[str] = set()
+        current = model_id
+        while current and current not in seen:
+            seen.add(current)
+            model = lookup.get(current)
+            if not model:
+                break
+            if str(model.get("modelKind") or "").upper() == "SHARED":
+                return current
+            base = model.get("baseModelId")
+            if not base:
+                break
+            current = base
+        return model_id
+
     def _overridden_topic_names(self, model_id: str) -> set[str] | None:
         """Return the set of topic names that a workbook REDEFINES in its own layer.
 
@@ -346,7 +453,8 @@ class ClientClass:
                 for f in files
                 if f.endswith(".topic")
             }
-        except Exception:
+        except Exception as exc:
+            self._swallow("override_probe", f"model_id={model_id}", exc)
             return None
 
     def _fetch_topics_for_model(self, model: dict[str, Any]) -> list[dict[str, Any]]:
@@ -367,7 +475,8 @@ class ClientClass:
             return []
         try:
             payload = self.get_model_yaml(model_id, mode="combined")
-        except Exception:
+        except Exception as exc:
+            self._swallow("model_yaml", f"model_id={model_id}", exc)
             return []
 
         kind = str(model.get("modelKind") or "").upper()
@@ -399,13 +508,20 @@ class ClientClass:
             if not topic_name:
                 continue
 
-            # Determine canonical owning model. For an inherited (non-overridden)
-            # workbook topic, anchor to the base shared model so the transformer
-            # emits one OmniV01Topic per logical topic rather than one per workbook.
-            # If the extension-YAML fetch failed (overridden is None), be
-            # conservative and keep the workbook as owner (no canonicalization).
-            if is_workbook and overridden is not None and topic_name not in overridden:
-                owning_model_id = base_model_id
+            # Determine canonical owning model. A workbook topic is either:
+            #   - genuinely overridden (probe found `<name>.topic` or `+<name>.topic`
+            #     in the extension YAML) -> owning is the workbook itself
+            #   - inherited from the SHARED ancestor -> walk baseModelId until
+            #     we hit that SHARED, so all N copies collapse to one QN
+            # A failed extension probe (overridden is None) means "we don't know
+            # which topics were overridden." Default to INHERITED (collapse) —
+            # the alternative default (keep as workbook) fails toward duplication,
+            # which is exactly the 170x bug we're fixing.
+            genuinely_overridden = (
+                is_workbook and overridden is not None and topic_name in overridden
+            )
+            if is_workbook and not genuinely_overridden:
+                owning_model_id = self._walk_to_shared_owner(model_id)
             else:
                 owning_model_id = model_id
 
@@ -668,7 +784,12 @@ class ClientClass:
         """
         try:
             payload = self.get_topic(model_id, topic_name)
-        except Exception:
+        except Exception as exc:
+            self._swallow(
+                "topic_detail",
+                f"model_id={model_id} topic={topic_name}",
+                exc,
+            )
             return {}
         try:
             topic = payload.get("topic") or {}
@@ -719,7 +840,12 @@ class ClientClass:
                 "measureNames": measure_names,
                 "viewSources": view_sources,
             }
-        except Exception:
+        except Exception as exc:
+            self._swallow(
+                "topic_detail",
+                f"model_id={model_id} topic={topic_name} (parse)",
+                exc,
+            )
             return {}
 
     def _fetch_document_detail(self, doc: dict[str, Any]) -> dict[str, Any]:
@@ -736,7 +862,8 @@ class ClientClass:
             return {}
         try:
             detail = self.get_document(identifier)
-        except Exception:
+        except Exception as exc:
+            self._swallow("document_detail", f"identifier={identifier}", exc)
             return {}
 
         try:
@@ -765,27 +892,40 @@ class ClientClass:
                 "modelId": doc_model_id,
                 "tileTopics": tile_topics,
             }
-        except Exception:
+        except Exception as exc:
+            self._swallow(
+                "document_detail",
+                f"identifier={identifier} (parse)",
+                exc,
+            )
             return {}
 
     @staticmethod
-    def _is_shadow_workbook(
+    def _is_workbook_without_content(
         model: dict[str, Any],
         document_model_ids: set[str],
+        aggressive: bool = True,
     ) -> bool:
-        """True for an unnamed WORKBOOK model that no document points at.
+        """True for a WORKBOOK model no document / dashboard / app references.
 
-        This is the same predicate `transformer._models` already applies when
-        deciding which models become entities, so skipping the YAML fan-out for
-        these models costs no OmniV01Model entity that v0.2.9 emits today. Their
-        topics are byte-identical copies of the SHARED parent's (which we do
-        fetch) and already dedup away in `transformer._topics`.
+        Apps and saved workbooks both surface through `/v1/documents` (confirmed
+        with the customer), so `document_model_ids` is the complete content
+        set — a workbook model absent from it is an ephemeral session Omni
+        auto-creates when a user opens a workbook. On a large tenant these
+        outnumber real workbooks by roughly two orders of magnitude.
+
+        `aggressive` is the config-flag escape hatch. When True (default),
+        catches every content-less workbook, named or not. When False, only
+        UNNAMED ones — the pre-fix v0.3.0 behaviour, kept for the rare tenant
+        whose named workbooks legitimately aren't in the document set.
         """
-        return (
-            str(model.get("modelKind") or "").upper() == "WORKBOOK"
-            and not model.get("name")
-            and str(model.get("id") or "") not in document_model_ids
-        )
+        if str(model.get("modelKind") or "").upper() != "WORKBOOK":
+            return False
+        if str(model.get("id") or "") in document_model_ids:
+            return False
+        if not aggressive and model.get("name"):
+            return False
+        return True
 
     def fetch_snapshot(
         self,
@@ -793,12 +933,15 @@ class ClientClass:
         max_pages: int | None = None,
         max_concurrency: int = 10,
         model_kinds: Sequence[str] | None = None,
+        crawl_only_content_backed_workbooks: bool = True,
         abort: threading.Event | None = None,
     ) -> dict[str, Any]:
         # Cap rather than reject: an operator page_size of 500 would otherwise
         # 400 on every listing call.
         page_size = min(int(page_size or 50), OMNI_MAX_PAGE_SIZE)
         self._abort = abort
+        # Reset per-run failure counters.
+        self._failures = {k: 0 for k in _FAILURE_CATEGORIES}
         connections = self.list_connections()
         logger.info(f"fetch_snapshot: {len(connections)} connections")
 
@@ -817,6 +960,12 @@ class ClientClass:
         else:
             models = self._collect_paginated(self.list_models, page_size, max_pages)
         logger.info(f"fetch_snapshot: {len(models)} models listed")
+
+        # Populate the per-run lookup used by _walk_to_shared_owner to climb
+        # the baseModelId chain from an inherited topic to its true SHARED
+        # ancestor (real Omni inheritance is deeper than one hop). Per-run
+        # storage is safe: item 3 gives each activity its own ClientClass.
+        self._model_lookup = {str(m["id"]): m for m in models if m.get("id")}
 
         folders = self._collect_paginated(self.list_folders, page_size, max_pages)
         logger.info(f"fetch_snapshot: {len(folders)} folders listed")
@@ -849,15 +998,20 @@ class ClientClass:
                         f"fetch_snapshot progress: docs {done_docs}/{total_docs}"
                     )
 
-        # Every model still lands in `models` (so `_models`, `model_to_connection`
-        # and the `baseModel` edge behave exactly as before); we only skip the
-        # ~46-requests-per-model topic fetch for the shadow copies.
+        # Drop content-less workbook models before the YAML fan-out. Every
+        # model still lands in `models` (so `model_to_connection` and the
+        # `omniV01BaseModel` edge behave exactly as before); the transformer
+        # is the second gate that keeps content-less workbook ENTITIES out of
+        # the catalog. Both gates share the same predicate for consistency.
         topic_models = [
-            m for m in models if not self._is_shadow_workbook(m, _seen_model_ids)
+            m for m in models
+            if not self._is_workbook_without_content(
+                m, _seen_model_ids, aggressive=crawl_only_content_backed_workbooks,
+            )
         ]
         logger.info(
             f"fetch_snapshot: fetching topics for {len(topic_models)}/{len(models)} "
-            f"models ({len(models) - len(topic_models)} shadow workbooks skipped)"
+            f"models ({len(models) - len(topic_models)} content-less workbooks skipped)"
         )
 
         topics: list[dict[str, Any]] = []
@@ -877,6 +1031,31 @@ class ClientClass:
                         f"topics_so_far={len(topics)}"
                     )
 
+        # Threshold check: abort BEFORE the transformer runs if the model pass
+        # lost too much. Prior behaviour was to swallow every failure silently
+        # and report success — the 29-minute run that lost 88% of its topics
+        # was the sentinel case. Checked here rather than at the end of
+        # fetch_snapshot because with maximum_attempts=1 (see workflow.py) a
+        # late abort costs a full three-hour re-crawl.
+        model_failures = self._failures.get("model_yaml", 0)
+        if total_models > 0:
+            failure_rate = model_failures / total_models
+            if failure_rate > _MODEL_YAML_FAILURE_ABORT_THRESHOLD:
+                raise OmniApiError(
+                    f"model-YAML fetch failed for {model_failures}/{total_models} "
+                    f"models ({failure_rate:.0%} > "
+                    f"{_MODEL_YAML_FAILURE_ABORT_THRESHOLD:.0%}). Aborting before "
+                    f"transform to avoid publishing a partial crawl.",
+                    retryable=True,
+                )
+        logger.info(
+            f"fetch_snapshot failures: "
+            f"model_yaml={self._failures['model_yaml']}/{total_models} "
+            f"override_probe={self._failures['override_probe']} "
+            f"topic_detail={self._failures['topic_detail']} "
+            f"document_detail={self._failures['document_detail']}/{len(documents)}"
+        )
+
         for model in models:
             model["updatedAt"] = _parse_dt(model.get("updatedAt"))
         for doc in documents:
@@ -894,4 +1073,9 @@ class ClientClass:
             "documents": documents,
             "topics": topics,
             "document_model_ids": document_model_ids,
+            # Threaded to the transformer so its entity filter matches the
+            # client's YAML pre-filter. Without this the transformer would
+            # emit OmniV01Model entities for workbooks whose topics we
+            # deliberately never fetched.
+            "crawl_only_content_backed_workbooks": crawl_only_content_backed_workbooks,
         }

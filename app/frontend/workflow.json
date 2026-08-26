@@ -97,6 +97,15 @@
           "grid": 8
         }
       },
+      "crawl_only_content_backed_workbooks": {
+        "type": "boolean",
+        "required": false,
+        "ui": {
+          "label": "Only crawl workbooks backed by content",
+          "help": "Default on. Skips ephemeral WORKBOOK models Omni creates for open sessions — on a large tenant these outnumber real workbooks 100:1. Turn off only if named workbooks in your tenant legitimately aren't in /v1/documents.",
+          "grid": 4
+        }
+      },
       "save_output_local": {
         "type": "boolean",
         "required": false,
@@ -131,7 +140,8 @@
           "timeout_seconds",
           "max_concurrency",
           "rate_limit_rpm",
-          "atlan_source_connection_map"
+          "atlan_source_connection_map",
+          "crawl_only_content_backed_workbooks"
         ]
       }
     ]

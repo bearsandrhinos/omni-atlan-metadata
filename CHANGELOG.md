@@ -4,6 +4,101 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-26
+
+Six fixes surfaced by Atlan's live-run review of v0.3.0 on the customer
+tenant. Every OmniV01 asset published in v0.3.0 was missing its parent /
+model / folder linkage (the three relationship names were mis-spelled and
+Atlan drops unknown relationship names silently on write), and every
+publish failed on 1–3 dangling ATLAS-404 references from four distinct
+reference-validity bugs. Two other classes of bug — shared-state
+corruption across concurrent runs, and duplicate topics at ~170× on
+deep-inheritance tenants — are also addressed here.
+
+### Fixed
+
+- **Relationship names + connection linkage (item 1).** Renamed the
+  three relationship keys the transformer writes to match the typedef
+  (`model` → `omniV01Model`, `baseModel` → `omniV01BaseModel`,
+  `folder` → `omniV01Folder`). Dropped the `connection` relationship
+  at three sites — there is no such relationship on the Omni types;
+  the linkage now travels on the inherited plain-string attribute
+  `connectionQualifiedName`, added on Model / Topic / Folder / Document.
+  Dropped `omniV01Url` (not on the typedef; `sourceURL` already carries
+  the same value and renders as a link).
+- **Emit-set gating on every internal reference (item 2).** Every
+  publish failure Atlan observed was ATLAS-404-00-00A — one to three
+  refs pointing at qualifiedNames the run wasn't also emitting.
+  `transform()` now pre-computes three emit-sets (`emitted_model_ids`,
+  `emitted_folder_ids`, `emitted_topic_qns`) before any relationship is
+  written; each entity builder gates its outgoing references against
+  them. Fixes topic→filtered-model, model→SCHEMA-base, doc→private-folder,
+  and the dashboard-tile fallback that fabricated dangling QNs when the
+  topic lookup missed.
+- **Per-run client + per-host shared rate limiter (item 3).** The SDK
+  creates one ActivitiesClass per pod and runs up to five activities
+  concurrently. `self.handler.client` was shared across all of them, so
+  credentials, HTTP client, cancel flag and rate limiter leaked between
+  runs — the 29-minute run whose topic counter froze at model 95 was
+  the sentinel case. Worse: `load_credentials` overwrote shared creds,
+  so a two-tenant customer could have one run crawl the other's org
+  with the other's token. Now `extract_and_transform_metadata` builds a
+  fresh ClientClass + HandlerClass per invocation and closes the client
+  in `finally`. The rate limiter alone stays process-wide (per Omni
+  host, via `_HOST_RATE_LIMITERS`) — throttling is a property of the
+  API, not of the run.
+- **Deeper baseModelId chain walk (items 4a + 4b + 4c).**
+  v0.3.0 filtered only UNNAMED workbook models absent from
+  /v1/documents. The customer's tenant had 19,937 workbook models most
+  of which were named ephemeral sessions Omni auto-creates when a user
+  opens a workbook; ~90% of the API traffic on that tenant was fetching
+  YAML for models that would never publish. The filter now catches any
+  WORKBOOK not in /v1/documents (apps, saved workbooks and dashboards
+  all surface through that endpoint — confirmed with the customer);
+  the escape hatch is the new `crawl_only_content_backed_workbooks`
+  config flag (default `true`).
+  v0.3.0's topic canonicalization also climbed exactly one hop from
+  workbook to baseModelId. Real Omni inheritance is deeper
+  (schema → shared → extension/branch → workbook), so a topic still
+  emitted a copy at each intermediate layer; the widest topic on the
+  customer's tenant had ~493 copies. The chain now climbs to the SHARED
+  ancestor, skipping SHARED_EXTENSION and BRANCH kinds that the typedef
+  can't represent. The extension-probe failure default also flips: an
+  unreadable probe now COLLAPSES the topic (inherited) rather than
+  keeping it (workbook) — the old default failed toward duplication.
+- **Silent failures now count, log, and abort past threshold (item 5).**
+  Six exception handlers in client.py returned an empty value with no
+  log and no counter, so the 29-minute run that lost 88% of its topics
+  reported `success: True`. Each handler now records the swallow via
+  `_swallow(category, context, exc)`, grouped by blast radius. If
+  >20% of model-YAML fetches fail, `fetch_snapshot` raises before the
+  transform pass — the check runs at end of model pass (~1 min in)
+  rather than end of `fetch_snapshot`, because with
+  `maximum_attempts=1` a late abort costs a full three-hour re-crawl.
+  Failure tallies are also surfaced in the activity result dict so they
+  land in Temporal history alongside the entity count.
+  Also fixed: `workflow.logger.info("Omni extraction completed: %s", …)`
+  never interpolated (the SDK's logger adapter doesn't do %-formatting)
+  so no run's entity count ever reached its own logs.
+- **One bad date no longer throws away a finished crawl (item 6).**
+  `_epoch_ms` raised on unparseable input; with `maximum_attempts=1`
+  that lost three hours of work to one malformed field. Now returns
+  None on parse failure and tolerates non-string values via `str()`.
+  Naive datetimes are treated as UTC (was container-local, which
+  drifted by whatever offset the pod happened to run in). `_parse_dt`
+  also returns None on failure so the bad value never reaches
+  `_epoch_ms`. Trailing slashes and whitespace are stripped from
+  operator-supplied `atlan_source_connection_map` paths so a pasted
+  `default/snowflake/1700000000/` doesn't produce a double slash in the
+  table qualifiedName. Deliberately no case normalisation — Atlan
+  warehouse qualifiedNames are case-sensitive and vary by warehouse.
+
+### Added
+
+- `tests/test_referential_closure.py` — Atlan's referential-closure
+  contract (5 cases) as the primary gate for item 2.
+- ~30 new regression fences across the six items.
+
 ## [0.3.0] - 2026-08-20
 
 Extraction performance and run observability, from an Atlan investigation of a

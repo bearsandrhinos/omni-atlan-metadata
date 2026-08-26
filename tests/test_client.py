@@ -37,6 +37,76 @@ def test_load_credentials_requires_protocol():
         ClientClass(credentials={"omni_base_url": "x.com/api", "omni_api_token": "t"})
 
 
+def test_rate_limiter_is_shared_across_clients_for_same_host():
+    """Item 3: throttling is a property of the Omni host, not the run. Two
+    concurrent activities against the same tenant must share one gate — five
+    per-run 60 rpm limiters is 300 rpm at Omni's door."""
+    creds = {"omni_base_url": "https://a.omniapp.co/api", "omni_api_token": "t"}
+    a = ClientClass(credentials=creds, rpm=0)
+    b = ClientClass(credentials=creds, rpm=0)
+    assert a._rate_limiter is b._rate_limiter
+
+
+def test_swallow_populates_failure_counters():
+    """Item 5: silently-swallowed errors must land in the per-run counters."""
+    client = ClientClass(credentials=CREDS, rpm=0)
+    assert client._failures["model_yaml"] == 0
+    client._swallow("model_yaml", "model_id=m1", RuntimeError("boom"))
+    client._swallow("model_yaml", "model_id=m2", RuntimeError("boom"))
+    client._swallow("topic_detail", "model_id=m1 topic=orders", RuntimeError("x"))
+    assert client._failures["model_yaml"] == 2
+    assert client._failures["topic_detail"] == 1
+    assert client._failures["override_probe"] == 0
+
+
+@respx.mock
+def test_fetch_snapshot_aborts_when_model_yaml_failure_rate_exceeds_threshold():
+    """Item 5 threshold: if >20% of model-YAML calls fail, abort before the
+    transform pass rather than publish a partial crawl. The check runs at end
+    of model pass (~1 min in), not end of fetch_snapshot — with
+    maximum_attempts=1 a late abort costs a full three-hour re-crawl."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(200, json={
+            "records": [{"id": f"m{i}", "modelKind": "SHARED"} for i in range(5)],
+            "pageInfo": {"hasNextPage": False},
+        })
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    # 3 of 5 models 500 -> 60% failure rate, well above the 20% floor.
+    for i in range(3):
+        respx.get(
+            f"https://test.omniapp.co/api/v1/models/m{i}/yaml", params={"mode": "combined"}
+        ).mock(return_value=httpx.Response(500, text="boom"))
+    for i in range(3, 5):
+        respx.get(
+            f"https://test.omniapp.co/api/v1/models/m{i}/yaml", params={"mode": "combined"}
+        ).mock(return_value=httpx.Response(200, json={"files": {}}))
+
+    with pytest.raises(OmniApiError, match="model-YAML fetch failed"):
+        make_client().fetch_snapshot(crawl_only_content_backed_workbooks=False)
+
+
+def test_rate_limiter_is_distinct_across_hosts():
+    """Different tenants share a pod but not a rate quota."""
+    a = ClientClass(
+        credentials={"omni_base_url": "https://a.omniapp.co/api", "omni_api_token": "t"},
+        rpm=0,
+    )
+    b = ClientClass(
+        credentials={"omni_base_url": "https://b.omniapp.co/api", "omni_api_token": "t"},
+        rpm=0,
+    )
+    assert a._rate_limiter is not b._rate_limiter
+
+
 def test_load_credentials_accepts_wire_shape():
     # Atlan UI → Heracles sends {"host": ..., "password": ..., "authType": "apikey"}.
     # ClientClass must accept these as aliases for omni_base_url / omni_api_token.
@@ -243,7 +313,9 @@ def test_fetch_snapshot_fetches_yaml_for_multiple_models_concurrently():
 
 @respx.mock
 def test_fetch_snapshot_yaml_failure_skips_model_but_continues():
-    """A failed YAML call for one model does not abort the rest of the batch."""
+    """A failed YAML call for a SMALL fraction of models does not abort the
+    batch. 1 of 6 fails = ~17%, safely under the 20% abort threshold; the
+    other 5 topics still land."""
     respx.get("https://test.omniapp.co/api/v1/connections").mock(
         return_value=httpx.Response(200, json={"connections": []})
     )
@@ -251,7 +323,7 @@ def test_fetch_snapshot_yaml_failure_skips_model_but_continues():
         return_value=httpx.Response(
             200,
             json={
-                "records": [{"id": "mod1"}, {"id": "mod2"}],
+                "records": [{"id": f"mod{i}"} for i in range(1, 7)],
                 "pageInfo": {"hasNextPage": False},
             },
         )
@@ -262,20 +334,22 @@ def test_fetch_snapshot_yaml_failure_skips_model_but_continues():
     respx.get("https://test.omniapp.co/api/v1/documents").mock(
         return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
     )
+    # mod1 fails; the other five succeed with one topic apiece.
     respx.get("https://test.omniapp.co/api/v1/models/mod1/yaml").mock(
         return_value=httpx.Response(500, text="Server Error")
     )
-    yaml2 = "label: Customers\nbase_view_name: customers_view\n"
-    respx.get("https://test.omniapp.co/api/v1/models/mod2/yaml").mock(
-        return_value=httpx.Response(200, json={"files": {"customers.topic": yaml2}})
-    )
-    respx.get("https://test.omniapp.co/api/v1/models/mod2/topic/customers").mock(
-        return_value=httpx.Response(404)
-    )
+    for i in range(2, 7):
+        yaml_body = f"label: t{i}\nbase_view_name: t{i}_view\n"
+        respx.get(f"https://test.omniapp.co/api/v1/models/mod{i}/yaml").mock(
+            return_value=httpx.Response(200, json={"files": {f"t{i}.topic": yaml_body}})
+        )
+        respx.get(f"https://test.omniapp.co/api/v1/models/mod{i}/topic/t{i}").mock(
+            return_value=httpx.Response(404)
+        )
 
     snapshot = make_client().fetch_snapshot()
-    assert len(snapshot["topics"]) == 1
-    assert snapshot["topics"][0]["modelId"] == "mod2"
+    assert len(snapshot["topics"]) == 5
+    assert {t["modelId"] for t in snapshot["topics"]} == {"mod2", "mod3", "mod4", "mod5", "mod6"}
 
 
 @respx.mock
@@ -583,7 +657,7 @@ def test_workbook_inherited_topic_owning_is_shared_model():
         return_value=httpx.Response(404)
     )
 
-    snapshot = make_client().fetch_snapshot()
+    snapshot = make_client().fetch_snapshot(crawl_only_content_backed_workbooks=False)
     topics_by_model = {t["modelId"]: t for t in snapshot["topics"]}
     assert topics_by_model["shared1"]["owningModelId"] == "shared1"
     assert topics_by_model["wb1"]["owningModelId"] == "shared1"
@@ -629,22 +703,25 @@ def test_workbook_overridden_topic_owning_is_workbook():
         return_value=httpx.Response(404)
     )
 
-    snapshot = make_client().fetch_snapshot()
+    snapshot = make_client().fetch_snapshot(crawl_only_content_backed_workbooks=False)
     topics_by_model = {t["modelId"]: t for t in snapshot["topics"]}
     assert topics_by_model["shared1"]["owningModelId"] == "shared1"
     assert topics_by_model["wb1"]["owningModelId"] == "wb1"
 
 
 @respx.mock
-def test_workbook_extension_fetch_failure_keeps_workbook_owning():
-    """If the extension YAML fetch fails, we can't tell inherited from overridden —
-    fall back to owning==modelId (no canonicalization) to avoid dropping data."""
+def test_workbook_extension_fetch_failure_collapses_to_shared_owner():
+    """Item 4c inversion: a failed extension probe means we don't know which
+    topics were overridden. Default to INHERITED (collapse to SHARED ancestor)
+    rather than KEPT (workbook as owner). The old default failed toward
+    duplication, which was the 170x bug."""
     respx.get("https://test.omniapp.co/api/v1/connections").mock(
         return_value=httpx.Response(200, json={"connections": []})
     )
     respx.get("https://test.omniapp.co/api/v1/models").mock(
         return_value=httpx.Response(200, json={
             "records": [
+                {"id": "shared1", "modelKind": "SHARED"},
                 {"id": "wb1", "name": "Workbook 1", "modelKind": "WORKBOOK", "baseModelId": "shared1"},
             ],
             "pageInfo": {"hasNextPage": False},
@@ -657,18 +734,73 @@ def test_workbook_extension_fetch_failure_keeps_workbook_owning():
         return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
     )
     yaml_body = "label: Orders\nbase_view_name: orders_view\n"
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/yaml", params={"mode": "combined"}).mock(
+        return_value=httpx.Response(200, json={"files": {"orders.topic": yaml_body}})
+    )
     respx.get("https://test.omniapp.co/api/v1/models/wb1/yaml", params={"mode": "combined"}).mock(
         return_value=httpx.Response(200, json={"files": {"orders.topic": yaml_body}})
     )
     respx.get("https://test.omniapp.co/api/v1/models/wb1/yaml", params={"mode": "extension"}).mock(
         return_value=httpx.Response(500, text="boom")
     )
+    respx.get("https://test.omniapp.co/api/v1/models/shared1/topic/orders").mock(
+        return_value=httpx.Response(404)
+    )
     respx.get("https://test.omniapp.co/api/v1/models/wb1/topic/orders").mock(
         return_value=httpx.Response(404)
     )
 
-    snapshot = make_client().fetch_snapshot()
-    assert snapshot["topics"][0]["owningModelId"] == "wb1"
+    snapshot = make_client().fetch_snapshot(crawl_only_content_backed_workbooks=False)
+    topics_by_model = {t["modelId"]: t for t in snapshot["topics"]}
+    # Both topic rows collapse to the SHARED ancestor's model id.
+    assert topics_by_model["wb1"]["owningModelId"] == "shared1"
+
+
+@respx.mock
+def test_workbook_chain_climbs_past_shared_extension_to_shared():
+    """Item 4b multi-hop walk: WORKBOOK -> SHARED_EXTENSION -> SHARED. The
+    single-hop v0.3.0 walk would have stopped at SHARED_EXTENSION, which is
+    not a representable OmniV01 model kind and would have dangled on publish."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(200, json={
+            "records": [
+                {"id": "shared1", "modelKind": "SHARED"},
+                {"id": "ext1", "modelKind": "SHARED_EXTENSION", "baseModelId": "shared1"},
+                {"id": "wb1", "name": "WB", "modelKind": "WORKBOOK", "baseModelId": "ext1"},
+            ],
+            "pageInfo": {"hasNextPage": False},
+        })
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    yaml_body = "label: Orders\nbase_view_name: orders_view\n"
+    for model_id in ("shared1", "ext1", "wb1"):
+        respx.get(
+            f"https://test.omniapp.co/api/v1/models/{model_id}/yaml",
+            params={"mode": "combined"},
+        ).mock(
+            return_value=httpx.Response(200, json={"files": {"orders.topic": yaml_body}})
+        )
+        respx.get(
+            f"https://test.omniapp.co/api/v1/models/{model_id}/topic/orders",
+        ).mock(return_value=httpx.Response(404))
+    for wb_model in ("ext1", "wb1"):
+        respx.get(
+            f"https://test.omniapp.co/api/v1/models/{wb_model}/yaml",
+            params={"mode": "extension"},
+        ).mock(return_value=httpx.Response(200, json={"files": {}}))
+
+    snapshot = make_client().fetch_snapshot(crawl_only_content_backed_workbooks=False)
+    topics_by_model = {t["modelId"]: t for t in snapshot["topics"]}
+    # The workbook's topic climbs past the SHARED_EXTENSION straight to SHARED.
+    assert topics_by_model["wb1"]["owningModelId"] == "shared1"
 
 
 @respx.mock
