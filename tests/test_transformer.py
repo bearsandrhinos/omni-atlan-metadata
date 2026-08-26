@@ -586,7 +586,10 @@ def _wb_snapshot(overridden: bool) -> dict:
             {"identifier": "doc1", "name": "Rev", "hasDashboard": True,
              "tileTopics": [{"modelId": "wb1", "topicName": "orders"}]},
         ],
-        "document_model_ids": [],
+        # Item 4a's aggressive filter would otherwise drop wb1 as a content-less
+        # workbook. This fixture is exercising the canonicalization logic on a
+        # workbook that IS content-backed (doc1 tiles into it).
+        "document_model_ids": ["wb1"],
     }
 
 
@@ -648,22 +651,22 @@ def test_source_process_deduped_to_shared_topic():
         == f"{CONN_QN}/model/shared1/topic/orders"
 
 
-def test_tile_topic_uncatalogued_falls_back_to_raw_model_id():
-    """If the tile references a topic we never enumerated (filtered/absent from
-    the snapshot), the Process still emits using the raw model_id — no crash."""
+def test_tile_topic_uncatalogued_is_skipped_not_backfilled():
+    """PART-1355 item 2 case 4: a tile referencing a topic the crawl never
+    enumerated (filtered / partial fetch) must NOT emit a Process. The
+    fallback-to-raw-model_id path Atlan flagged was creating dangling
+    references that ATLAS-404'd the whole publish."""
     snap = {
         "connections": [],
-        "models": [{"id": "wb1", "name": "WB", "modelKind": "SHARED"}],
+        "models": [{"id": "shared1", "name": "S", "modelKind": "SHARED"}],
         "topics": [],  # no topic enumerated
         "folders": [],
         "documents": [
             {"identifier": "d1", "name": "D", "hasDashboard": True,
-             "tileTopics": [{"modelId": "wb1", "topicName": "unknown"}]},
+             "tileTopics": [{"modelId": "shared1", "topicName": "unknown"}]},
         ],
         "document_model_ids": [],
     }
     result = OmniMetadataTransformer(connection_epoch_ms=EPOCH).transform(snap)
     procs = [e for e in result if e["typeName"] == "Process"]
-    assert len(procs) == 1
-    assert procs[0]["attributes"]["qualifiedName"] \
-        == f"{CONN_QN}/process/topic/wb1/unknown/document/d1"
+    assert procs == []
