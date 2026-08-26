@@ -66,13 +66,19 @@ def _get_host_rate_limiter(base_url: str, rpm: int) -> _RateLimiter:
     return limiter
 
 
-def _parse_dt(value: str | None) -> str | None:
+def _parse_dt(value: Any) -> str | None:
+    """Normalise an ISO-8601 string to canonical isoformat.
+
+    Returns None on parse failure so the bad value never reaches the
+    transformer's _epoch_ms (which would otherwise raise and take down
+    the whole run — see PART-1079 rev 2 in the Atlan review).
+    """
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat()
-    except ValueError:
-        return value
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).isoformat()
+    except (ValueError, TypeError):
+        return None
 
 
 @dataclass
@@ -105,6 +111,25 @@ class NonRetryableOmniApiError(OmniApiError):
     pass
 
 
+# Per-run tallies of silently-swallowed errors, grouped by blast radius.
+# One model-YAML failure loses that whole model's topics; one topic-detail
+# failure loses one topic's enrichment; one document-detail failure loses one
+# doc's tile-topic edges. Emitting these blended into one pooled ratio hides
+# whichever is dominating, so each category is counted separately.
+_FAILURE_CATEGORIES = (
+    "model_yaml",
+    "override_probe",
+    "topic_detail",
+    "document_detail",
+)
+
+# If more than this fraction of model-YAML fetches fail, abort after the
+# model pass — before we spend three hours on a run whose topic side will
+# be inconsistent anyway. Checked in fetch_snapshot with maximum_attempts=1
+# in mind: a late abort costs a full re-crawl.
+_MODEL_YAML_FAILURE_ABORT_THRESHOLD = 0.20
+
+
 class ClientClass:
     def __init__(
         self,
@@ -119,8 +144,22 @@ class ClientClass:
         # Set by fetch_snapshot; lets a Temporal cancellation drain the thread
         # pool instead of the pool outliving the activity (see handler).
         self._abort: threading.Event | None = None
+        # Per-run failure tallies. Reset at fetch_snapshot start.
+        self._failures: dict[str, int] = {k: 0 for k in _FAILURE_CATEGORIES}
         if credentials:
             self.load_credentials(credentials)
+
+    def _swallow(self, category: str, context: str, exc: BaseException) -> None:
+        """Record + log a silently-caught error so it isn't invisible.
+
+        The bare `except Exception: return {}` pattern was correct in intent
+        (one bad topic shouldn't fail the crawl) but wrong in execution:
+        with no counter and no log, the 29-minute run that lost 88% of its
+        topics still reported success. Callers still swallow; this method
+        just makes the swallow observable.
+        """
+        self._failures[category] = self._failures.get(category, 0) + 1
+        logger.warning(f"omni fetch failure ({category}) {context}: {exc!r}")
 
     def load_credentials(self, credentials: dict[str, Any]) -> None:
         # Accept both credential shapes:
@@ -402,7 +441,8 @@ class ClientClass:
                 for f in files
                 if f.endswith(".topic")
             }
-        except Exception:
+        except Exception as exc:
+            self._swallow("override_probe", f"model_id={model_id}", exc)
             return None
 
     def _fetch_topics_for_model(self, model: dict[str, Any]) -> list[dict[str, Any]]:
@@ -423,7 +463,8 @@ class ClientClass:
             return []
         try:
             payload = self.get_model_yaml(model_id, mode="combined")
-        except Exception:
+        except Exception as exc:
+            self._swallow("model_yaml", f"model_id={model_id}", exc)
             return []
 
         kind = str(model.get("modelKind") or "").upper()
@@ -731,7 +772,12 @@ class ClientClass:
         """
         try:
             payload = self.get_topic(model_id, topic_name)
-        except Exception:
+        except Exception as exc:
+            self._swallow(
+                "topic_detail",
+                f"model_id={model_id} topic={topic_name}",
+                exc,
+            )
             return {}
         try:
             topic = payload.get("topic") or {}
@@ -782,7 +828,12 @@ class ClientClass:
                 "measureNames": measure_names,
                 "viewSources": view_sources,
             }
-        except Exception:
+        except Exception as exc:
+            self._swallow(
+                "topic_detail",
+                f"model_id={model_id} topic={topic_name} (parse)",
+                exc,
+            )
             return {}
 
     def _fetch_document_detail(self, doc: dict[str, Any]) -> dict[str, Any]:
@@ -799,7 +850,8 @@ class ClientClass:
             return {}
         try:
             detail = self.get_document(identifier)
-        except Exception:
+        except Exception as exc:
+            self._swallow("document_detail", f"identifier={identifier}", exc)
             return {}
 
         try:
@@ -828,7 +880,12 @@ class ClientClass:
                 "modelId": doc_model_id,
                 "tileTopics": tile_topics,
             }
-        except Exception:
+        except Exception as exc:
+            self._swallow(
+                "document_detail",
+                f"identifier={identifier} (parse)",
+                exc,
+            )
             return {}
 
     @staticmethod
@@ -871,6 +928,8 @@ class ClientClass:
         # 400 on every listing call.
         page_size = min(int(page_size or 50), OMNI_MAX_PAGE_SIZE)
         self._abort = abort
+        # Reset per-run failure counters.
+        self._failures = {k: 0 for k in _FAILURE_CATEGORIES}
         connections = self.list_connections()
         logger.info(f"fetch_snapshot: {len(connections)} connections")
 
@@ -959,6 +1018,31 @@ class ClientClass:
                         f"fetch_snapshot progress: models {done_models}/{total_models}, "
                         f"topics_so_far={len(topics)}"
                     )
+
+        # Threshold check: abort BEFORE the transformer runs if the model pass
+        # lost too much. Prior behaviour was to swallow every failure silently
+        # and report success — the 29-minute run that lost 88% of its topics
+        # was the sentinel case. Checked here rather than at the end of
+        # fetch_snapshot because with maximum_attempts=1 (see workflow.py) a
+        # late abort costs a full three-hour re-crawl.
+        model_failures = self._failures.get("model_yaml", 0)
+        if total_models > 0:
+            failure_rate = model_failures / total_models
+            if failure_rate > _MODEL_YAML_FAILURE_ABORT_THRESHOLD:
+                raise OmniApiError(
+                    f"model-YAML fetch failed for {model_failures}/{total_models} "
+                    f"models ({failure_rate:.0%} > "
+                    f"{_MODEL_YAML_FAILURE_ABORT_THRESHOLD:.0%}). Aborting before "
+                    f"transform to avoid publishing a partial crawl.",
+                    retryable=True,
+                )
+        logger.info(
+            f"fetch_snapshot failures: "
+            f"model_yaml={self._failures['model_yaml']}/{total_models} "
+            f"override_probe={self._failures['override_probe']} "
+            f"topic_detail={self._failures['topic_detail']} "
+            f"document_detail={self._failures['document_detail']}/{len(documents)}"
+        )
 
         for model in models:
             model["updatedAt"] = _parse_dt(model.get("updatedAt"))

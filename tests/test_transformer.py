@@ -128,6 +128,59 @@ def test_no_connection_entity_emitted():
 
 
 # ---------------------------------------------------------------------------
+# Item 6 — _epoch_ms robustness (one bad date must not fail the whole crawl)
+# ---------------------------------------------------------------------------
+
+def test_epoch_ms_returns_none_on_garbage_string():
+    """Item 6: an unparseable value returns None, not a crash. With
+    maximum_attempts=1 in workflow.py, a raise here loses three hours of work."""
+    from app.transformer import _epoch_ms
+    assert _epoch_ms("not-a-date") is None
+
+
+def test_epoch_ms_returns_none_on_non_string():
+    """str(value) inside _epoch_ms handles int/list/None-with-str-cast paths."""
+    from app.transformer import _epoch_ms
+    assert _epoch_ms(12345) is None  # int is not ISO-8601
+    assert _epoch_ms(None) is None
+    assert _epoch_ms("") is None
+
+
+def test_epoch_ms_naive_datetime_treated_as_utc():
+    """A naive datetime string (no tz) is currently read in the container's
+    local zone — pods run in various regions. Force UTC so timestamps don't
+    drift by the pod's offset."""
+    from app.transformer import _epoch_ms
+    # 2024-01-01T00:00:00Z == 1704067200000 ms
+    assert _epoch_ms("2024-01-01T00:00:00") == 1704067200000
+
+
+def test_epoch_ms_iso_with_tz_unchanged():
+    from app.transformer import _epoch_ms
+    assert _epoch_ms("2024-01-01T00:00:00+00:00") == 1704067200000
+
+
+def test_atlan_source_connection_map_strips_trailing_slash():
+    """Operator-pasted paths often have a trailing slash; the resulting
+    double-slash in the table qualifiedName gets rejected by Atlan."""
+    t = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        atlan_source_connection_map={"conn1": "default/snowflake/1700000000/  "},
+    )
+    assert t.atlan_source_connection_map["conn1"] == "default/snowflake/1700000000"
+
+
+def test_atlan_source_connection_map_preserves_case():
+    """Atlan warehouse qualifiedNames are case-sensitive (Snowflake uppercases,
+    Postgres does not) — the strip must not fold case."""
+    t = OmniMetadataTransformer(
+        connection_epoch_ms=EPOCH,
+        atlan_source_connection_map={"c1": "default/Snowflake/ID/"},
+    )
+    assert t.atlan_source_connection_map["c1"] == "default/Snowflake/ID"
+
+
+# ---------------------------------------------------------------------------
 # Constructor validation
 # ---------------------------------------------------------------------------
 

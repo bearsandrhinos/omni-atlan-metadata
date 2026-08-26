@@ -252,4 +252,9 @@ class ActivitiesClass(ActivitiesInterface):
                 "folders": len(snapshot.get("folders", [])),
                 "documents": len(snapshot.get("documents", [])),
             },
+            # Surface swallowed-error tallies in the activity result so a
+            # run that reported success but lost 88% of its topics doesn't
+            # go unnoticed in Temporal history. Defensive .get: an older
+            # ClientClass without _failures still returns {}.
+            "fetch_failures": dict(getattr(run_client, "_failures", {})),
         }

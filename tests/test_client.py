@@ -47,6 +47,53 @@ def test_rate_limiter_is_shared_across_clients_for_same_host():
     assert a._rate_limiter is b._rate_limiter
 
 
+def test_swallow_populates_failure_counters():
+    """Item 5: silently-swallowed errors must land in the per-run counters."""
+    client = ClientClass(credentials=CREDS, rpm=0)
+    assert client._failures["model_yaml"] == 0
+    client._swallow("model_yaml", "model_id=m1", RuntimeError("boom"))
+    client._swallow("model_yaml", "model_id=m2", RuntimeError("boom"))
+    client._swallow("topic_detail", "model_id=m1 topic=orders", RuntimeError("x"))
+    assert client._failures["model_yaml"] == 2
+    assert client._failures["topic_detail"] == 1
+    assert client._failures["override_probe"] == 0
+
+
+@respx.mock
+def test_fetch_snapshot_aborts_when_model_yaml_failure_rate_exceeds_threshold():
+    """Item 5 threshold: if >20% of model-YAML calls fail, abort before the
+    transform pass rather than publish a partial crawl. The check runs at end
+    of model pass (~1 min in), not end of fetch_snapshot — with
+    maximum_attempts=1 a late abort costs a full three-hour re-crawl."""
+    respx.get("https://test.omniapp.co/api/v1/connections").mock(
+        return_value=httpx.Response(200, json={"connections": []})
+    )
+    respx.get("https://test.omniapp.co/api/v1/models").mock(
+        return_value=httpx.Response(200, json={
+            "records": [{"id": f"m{i}", "modelKind": "SHARED"} for i in range(5)],
+            "pageInfo": {"hasNextPage": False},
+        })
+    )
+    respx.get("https://test.omniapp.co/api/v1/folders").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    respx.get("https://test.omniapp.co/api/v1/documents").mock(
+        return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
+    )
+    # 3 of 5 models 500 -> 60% failure rate, well above the 20% floor.
+    for i in range(3):
+        respx.get(
+            f"https://test.omniapp.co/api/v1/models/m{i}/yaml", params={"mode": "combined"}
+        ).mock(return_value=httpx.Response(500, text="boom"))
+    for i in range(3, 5):
+        respx.get(
+            f"https://test.omniapp.co/api/v1/models/m{i}/yaml", params={"mode": "combined"}
+        ).mock(return_value=httpx.Response(200, json={"files": {}}))
+
+    with pytest.raises(OmniApiError, match="model-YAML fetch failed"):
+        make_client().fetch_snapshot(crawl_only_content_backed_workbooks=False)
+
+
 def test_rate_limiter_is_distinct_across_hosts():
     """Different tenants share a pod but not a rate quota."""
     a = ClientClass(
@@ -266,7 +313,9 @@ def test_fetch_snapshot_fetches_yaml_for_multiple_models_concurrently():
 
 @respx.mock
 def test_fetch_snapshot_yaml_failure_skips_model_but_continues():
-    """A failed YAML call for one model does not abort the rest of the batch."""
+    """A failed YAML call for a SMALL fraction of models does not abort the
+    batch. 1 of 6 fails = ~17%, safely under the 20% abort threshold; the
+    other 5 topics still land."""
     respx.get("https://test.omniapp.co/api/v1/connections").mock(
         return_value=httpx.Response(200, json={"connections": []})
     )
@@ -274,7 +323,7 @@ def test_fetch_snapshot_yaml_failure_skips_model_but_continues():
         return_value=httpx.Response(
             200,
             json={
-                "records": [{"id": "mod1"}, {"id": "mod2"}],
+                "records": [{"id": f"mod{i}"} for i in range(1, 7)],
                 "pageInfo": {"hasNextPage": False},
             },
         )
@@ -285,20 +334,22 @@ def test_fetch_snapshot_yaml_failure_skips_model_but_continues():
     respx.get("https://test.omniapp.co/api/v1/documents").mock(
         return_value=httpx.Response(200, json={"records": [], "pageInfo": {"hasNextPage": False}})
     )
+    # mod1 fails; the other five succeed with one topic apiece.
     respx.get("https://test.omniapp.co/api/v1/models/mod1/yaml").mock(
         return_value=httpx.Response(500, text="Server Error")
     )
-    yaml2 = "label: Customers\nbase_view_name: customers_view\n"
-    respx.get("https://test.omniapp.co/api/v1/models/mod2/yaml").mock(
-        return_value=httpx.Response(200, json={"files": {"customers.topic": yaml2}})
-    )
-    respx.get("https://test.omniapp.co/api/v1/models/mod2/topic/customers").mock(
-        return_value=httpx.Response(404)
-    )
+    for i in range(2, 7):
+        yaml_body = f"label: t{i}\nbase_view_name: t{i}_view\n"
+        respx.get(f"https://test.omniapp.co/api/v1/models/mod{i}/yaml").mock(
+            return_value=httpx.Response(200, json={"files": {f"t{i}.topic": yaml_body}})
+        )
+        respx.get(f"https://test.omniapp.co/api/v1/models/mod{i}/topic/t{i}").mock(
+            return_value=httpx.Response(404)
+        )
 
     snapshot = make_client().fetch_snapshot()
-    assert len(snapshot["topics"]) == 1
-    assert snapshot["topics"][0]["modelId"] == "mod2"
+    assert len(snapshot["topics"]) == 5
+    assert {t["modelId"] for t in snapshot["topics"]} == {"mod2", "mod3", "mod4", "mod5", "mod6"}
 
 
 @respx.mock

@@ -18,8 +18,12 @@ default/omni/{connection_epoch_ms} qualifiedName.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+
+from application_sdk.observability.logger_adaptor import get_logger
+
+logger = get_logger(__name__)
 
 # Atlan-side enum value sets — defensive normalization for upstream Omni
 # strings that may arrive in mixed casing. Values not in these sets are
@@ -29,16 +33,29 @@ _MODEL_KINDS = {"SHARED", "WORKBOOK"}
 _SCOPES = {"ORGANIZATION", "WORKSPACE", "PRIVATE", "SHARED"}
 
 
-def _epoch_ms(value: str | None) -> int | None:
-    """Convert an ISO-8601 datetime string to epoch milliseconds.
+def _epoch_ms(value: Any) -> int | None:
+    """Convert a datetime-ish value to epoch milliseconds.
 
     Atlan's date attributes (e.g. sourceUpdatedAt) are stored as epoch-ms
-    integers. Passing an ISO string causes Atlas date validation to reject
-    the entity on create.
+    integers. Passing an ISO string causes Atlas to reject the whole
+    entity on create — and with `maximum_attempts=1`, one unparseable
+    date fails a three-hour crawl. Return None on any parse failure so a
+    bad field is a missing attribute, not a lost run.
+
+    A naive datetime is treated as UTC. Reading it in the container's
+    local zone would silently mis-timestamp assets by whatever offset the
+    pod happens to be running in.
     """
     if not value:
         return None
-    return int(datetime.fromisoformat(value).timestamp() * 1000)
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (ValueError, TypeError):
+        logger.warning("sourceUpdatedAt: unparseable datetime %r; dropping.", value)
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
 
 
 class OmniMetadataTransformer:
@@ -56,7 +73,17 @@ class OmniMetadataTransformer:
         # Omni-connection-id -> Atlan source-connection qualifiedName (e.g.
         # the Snowflake/BigQuery connection that backs an Omni model).
         # Drives source-table -> topic Process emission only.
-        self.atlan_source_connection_map = atlan_source_connection_map or {}
+        # Strip trailing slashes and whitespace on operator-supplied paths so a
+        # value pasted as `default/snowflake/1700000000/` doesn't produce a
+        # double-slash in the table qualifiedName and get rejected by Atlan.
+        # Deliberately NO case normalisation — Atlan warehouse qualifiedNames
+        # are case-sensitive and vary by warehouse (Snowflake uppercases,
+        # Postgres does not).
+        self.atlan_source_connection_map = {
+            k: str(v).strip().rstrip("/")
+            for k, v in (atlan_source_connection_map or {}).items()
+            if k and v
+        }
 
     # ------------------------------------------------------------------ #
     # Public entrypoint

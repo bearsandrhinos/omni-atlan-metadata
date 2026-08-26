@@ -59,7 +59,10 @@ class WorkflowClass(WorkflowInterface):
             start_to_close_timeout=FETCH_START_TO_CLOSE_TIMEOUT,
             heartbeat_timeout=FETCH_HEARTBEAT_TIMEOUT,
         )
-        workflow.logger.info("Omni extraction completed: %s", extraction_result)
+        # f-string, not %s + arg: the SDK's logger adapter doesn't interpolate
+        # the format args, so `%s` reached the pod logs as a literal and no
+        # run's entity count was ever recorded.
+        workflow.logger.info(f"Omni extraction completed: {extraction_result}")
 
     @staticmethod
     def get_activities(activities: ActivitiesInterface) -> Sequence[Callable[..., Any]]:
