@@ -249,6 +249,18 @@ class ClientClass:
                 ) from exc
 
             status = response.status_code
+            if 300 <= status < 400:
+                # A 3xx from Omni's API almost always means the base URL is
+                # wrong (typically missing the `/api` suffix — the marketing
+                # site 302s to docs). Fail loud with the target URL so the
+                # operator gets a useful message rather than a JSONDecodeError.
+                location = response.headers.get("location") or "(no Location header)"
+                raise NonRetryableOmniApiError(
+                    f"GET {path} redirected ({status} -> {location}). Check "
+                    f"omni_base_url — Omni's REST API lives under `/api`.",
+                    status_code=status,
+                    retryable=False,
+                )
             if status < 400:
                 data = response.json()
                 if not isinstance(data, dict):
