@@ -1,6 +1,6 @@
 [project]
 name = "omni-connector-app"
-version = "0.3.0"
+version = "0.4.0"
 description = "Atlan custom app for extracting Omni metadata."
 authors = [{ name = "Atlan App Team", email = "connect@atlan.com" }]
 requires-python = ">=3.11,<3.14"
