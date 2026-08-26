@@ -351,6 +351,38 @@ class ClientClass:
                 break
         return rows
 
+    def _walk_to_shared_owner(self, model_id: str) -> str:
+        """Climb baseModelId until we hit a SHARED ancestor.
+
+        Real Omni inheritance is deeper than one hop: schema -> shared ->
+        extension/branch -> workbook. v0.3.0 canonicalized one level up, so an
+        inherited topic still emitted a copy for every intermediate layer.
+        On the customer's tenant this produced ~493 copies of the same topic.
+
+        Also handles the SHARED_EXTENSION / BRANCH case: those kinds are not
+        representable as OmniV01Model, so climbing past them lands on the
+        SHARED ancestor that IS representable.
+
+        Falls back to `model_id` if the chain doesn't reach a SHARED (chain
+        broken, or terminates in a non-SHARED). The referential-closure gate
+        will flag any dangling relationship this creates.
+        """
+        lookup = getattr(self, "_model_lookup", None) or {}
+        seen: set[str] = set()
+        current = model_id
+        while current and current not in seen:
+            seen.add(current)
+            model = lookup.get(current)
+            if not model:
+                break
+            if str(model.get("modelKind") or "").upper() == "SHARED":
+                return current
+            base = model.get("baseModelId")
+            if not base:
+                break
+            current = base
+        return model_id
+
     def _overridden_topic_names(self, model_id: str) -> set[str] | None:
         """Return the set of topic names that a workbook REDEFINES in its own layer.
 
@@ -423,13 +455,20 @@ class ClientClass:
             if not topic_name:
                 continue
 
-            # Determine canonical owning model. For an inherited (non-overridden)
-            # workbook topic, anchor to the base shared model so the transformer
-            # emits one OmniV01Topic per logical topic rather than one per workbook.
-            # If the extension-YAML fetch failed (overridden is None), be
-            # conservative and keep the workbook as owner (no canonicalization).
-            if is_workbook and overridden is not None and topic_name not in overridden:
-                owning_model_id = base_model_id
+            # Determine canonical owning model. A workbook topic is either:
+            #   - genuinely overridden (probe found `<name>.topic` or `+<name>.topic`
+            #     in the extension YAML) -> owning is the workbook itself
+            #   - inherited from the SHARED ancestor -> walk baseModelId until
+            #     we hit that SHARED, so all N copies collapse to one QN
+            # A failed extension probe (overridden is None) means "we don't know
+            # which topics were overridden." Default to INHERITED (collapse) —
+            # the alternative default (keep as workbook) fails toward duplication,
+            # which is exactly the 170x bug we're fixing.
+            genuinely_overridden = (
+                is_workbook and overridden is not None and topic_name in overridden
+            )
+            if is_workbook and not genuinely_overridden:
+                owning_model_id = self._walk_to_shared_owner(model_id)
             else:
                 owning_model_id = model_id
 
@@ -850,6 +889,12 @@ class ClientClass:
         else:
             models = self._collect_paginated(self.list_models, page_size, max_pages)
         logger.info(f"fetch_snapshot: {len(models)} models listed")
+
+        # Populate the per-run lookup used by _walk_to_shared_owner to climb
+        # the baseModelId chain from an inherited topic to its true SHARED
+        # ancestor (real Omni inheritance is deeper than one hop). Per-run
+        # storage is safe: item 3 gives each activity its own ClientClass.
+        self._model_lookup = {str(m["id"]): m for m in models if m.get("id")}
 
         folders = self._collect_paginated(self.list_folders, page_size, max_pages)
         logger.info(f"fetch_snapshot: {len(folders)} folders listed")
