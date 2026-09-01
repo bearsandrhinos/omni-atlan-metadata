@@ -826,3 +826,92 @@ def test_fetch_snapshot_skips_non_topic_files():
 
     snapshot = make_client().fetch_snapshot()
     assert snapshot["topics"] == []
+
+
+# ---------------------------------------------------------------------------
+# topic-detail memoization
+#
+# A live run against a large org issued 25,831 topic-detail requests that
+# resolved to 93 distinct topics: every workbook inheriting a shared topic
+# re-fetched it. These are invariants on the request COUNT, not on any one
+# call site, so they stay meaningful if the fetch path is refactored.
+# ---------------------------------------------------------------------------
+
+def test_topic_detail_is_fetched_once_per_owning_model_and_topic():
+    """N workbooks inheriting one shared topic cost ONE topic-detail request."""
+    client = make_client()
+    calls: list[tuple[str, str]] = []
+
+    def _record(model_id: str, topic_name: str) -> dict:
+        calls.append((model_id, topic_name))
+        return {"sourceTableName": "orders"}
+
+    client._fetch_topic_detail = _record  # type: ignore[assignment]
+
+    for _ in range(50):
+        detail = client._fetch_topic_detail_cached("shared-model-1", "orders")
+        assert detail == {"sourceTableName": "orders"}
+
+    assert len(calls) == 1, f"expected 1 fetch, got {len(calls)}"
+    assert calls[0] == ("shared-model-1", "orders")
+
+
+def test_topic_detail_cache_separates_distinct_keys():
+    """Distinct owning models, and distinct topics, are cached independently."""
+    client = make_client()
+    calls: list[tuple[str, str]] = []
+
+    def _record(model_id: str, topic_name: str) -> dict:
+        calls.append((model_id, topic_name))
+        return {"sourceTableName": f"{model_id}:{topic_name}"}
+
+    client._fetch_topic_detail = _record  # type: ignore[assignment]
+
+    for _ in range(10):
+        client._fetch_topic_detail_cached("model-a", "orders")
+        client._fetch_topic_detail_cached("model-a", "users")
+        client._fetch_topic_detail_cached("model-b", "orders")
+
+    assert len(calls) == 3
+    assert set(calls) == {
+        ("model-a", "orders"),
+        ("model-a", "users"),
+        ("model-b", "orders"),
+    }
+
+
+def test_topic_detail_failure_is_not_cached():
+    """A failed fetch returns {} and is retried, not permanently blanked.
+
+    Caching {} would let one transient failure blank that topic for every
+    workbook in the run - a worse trade than re-attempting it.
+    """
+    client = make_client()
+    calls: list[tuple[str, str]] = []
+
+    def _record(model_id: str, topic_name: str) -> dict:
+        calls.append((model_id, topic_name))
+        return {}
+
+    client._fetch_topic_detail = _record  # type: ignore[assignment]
+
+    assert client._fetch_topic_detail_cached("model-a", "orders") == {}
+    assert client._fetch_topic_detail_cached("model-a", "orders") == {}
+    assert len(calls) == 2
+
+
+def test_host_rate_limiter_ratchets_down_never_up():
+    """The most conservative rpm any run asked for wins for the host."""
+    from app.client import _RateLimiter
+
+    limiter = _RateLimiter(60)
+    assert limiter.min_interval == pytest.approx(1.0)
+
+    limiter.tighten_to(10)          # 6s spacing - more restrictive
+    assert limiter.min_interval == pytest.approx(6.0)
+
+    limiter.tighten_to(60)          # would loosen - must be ignored
+    assert limiter.min_interval == pytest.approx(6.0)
+
+    limiter.tighten_to(0)           # rpm=0 must never disable it
+    assert limiter.min_interval == pytest.approx(6.0)

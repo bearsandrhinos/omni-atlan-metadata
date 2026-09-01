@@ -98,7 +98,6 @@ _OMNI_V01_ATTRS: list[AttributeDef] = [
         description="Omni-side stable identifier. Required round-trip handle.",
     ),
     _str(
-        "omniV01Url",
         indexed=False,
         description="Direct deep-link back to the asset in Omni's UI.",
     ),
@@ -220,32 +219,47 @@ def _end_def(
 
 
 RELATIONSHIP_DEFS: list[RelationshipDef] = [
+    # These three are transcribed from the SERVED typedef, read live from a
+    # seeded tenant via `GET /api/meta/types/typedefs?type=relationship`. They
+    # had drifted from an older draft: the attribute names lacked the omniV01
+    # prefix, and the derived-models def additionally had the wrong category
+    # (ASSOCIATION vs AGGREGATION) and was missing is_container on end 1.
+    #
+    # On any tenant where the typedefs are pre-seeded this file is inert, so
+    # the drift was invisible. It bites only on a tenant where the app creates
+    # them itself. Regenerating this block from the served typedef is more
+    # reliable than hand-patching, and would stop it drifting again when the
+    # V01 suffix is dropped at GA.
     RelationshipDef(
         name="omni_v01model_omni_v01topics",
         relationship_category="AGGREGATION",
-        relationship_label="__OmniV01Model.topics",
-        end_def1=_end_def("OmniV01Model", "topics", "SET", is_container=True),
-        end_def2=_end_def("OmniV01Topic", "model", "SINGLE"),
+        relationship_label="__OmniV01Model.omniV01Topics",
+        end_def1=_end_def("OmniV01Model", "omniV01Topics", "SET", is_container=True),
+        end_def2=_end_def("OmniV01Topic", "omniV01Model", "SINGLE"),
         description="OmniV01Model owns one-to-many OmniV01Topic.",
     ),
     RelationshipDef(
         name="omni_v01base_model_omni_v01derived_models",
-        relationship_category="ASSOCIATION",
-        relationship_label="__OmniV01Model.baseModel",
-        end_def1=_end_def("OmniV01Model", "derivedModels", "SET"),
-        end_def2=_end_def("OmniV01Model", "baseModel", "SINGLE"),
+        relationship_category="AGGREGATION",
+        relationship_label="__OmniV01Model.omniV01DerivedModels",
+        end_def1=_end_def(
+            "OmniV01Model", "omniV01DerivedModels", "SET", is_container=True
+        ),
+        end_def2=_end_def("OmniV01Model", "omniV01BaseModel", "SINGLE"),
         description=(
             "Self-referential model inheritance: a derived model points at "
-            "its shared base model via baseModel; the base side exposes "
-            "derivedModels."
+            "its shared base model via omniV01BaseModel; the base side "
+            "exposes omniV01DerivedModels."
         ),
     ),
     RelationshipDef(
         name="omni_v01folder_omni_v01documents",
         relationship_category="AGGREGATION",
-        relationship_label="__OmniV01Folder.documents",
-        end_def1=_end_def("OmniV01Folder", "documents", "SET", is_container=True),
-        end_def2=_end_def("OmniV01Document", "folder", "SINGLE"),
+        relationship_label="__OmniV01Folder.omniV01Documents",
+        end_def1=_end_def(
+            "OmniV01Folder", "omniV01Documents", "SET", is_container=True
+        ),
+        end_def2=_end_def("OmniV01Document", "omniV01Folder", "SINGLE"),
         description="OmniV01Folder contains one-to-many OmniV01Document.",
     ),
 ]

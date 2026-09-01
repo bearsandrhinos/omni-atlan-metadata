@@ -10,6 +10,22 @@ from .client import ClientClass
 logger = get_logger(__name__)
 
 
+# Argo passes workflow parameters as STRINGS, so the operator setting a flag to
+# "false" arrives as the string "false" — and bool("false") is True. Every
+# boolean read off the form/state path must go through this. "null" is in the
+# falsey set because the app already treats the literal string "null" as a
+# sentinel elsewhere (activities.py, handler.py).
+_FALSEY = ("false", "0", "no", "off", "null", "none", "")
+
+
+def _to_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in _FALSEY
+
+
 class HandlerClass(HandlerInterface):
     def __init__(self, client: ClientClass | None = None):
         self.client = client or ClientClass()
@@ -54,9 +70,7 @@ class HandlerClass(HandlerInterface):
         # sessions Omni auto-creates and are not worth crawling. Escape hatch
         # is the config flag `crawl_only_content_backed_workbooks=false`.
         raw_flag = metadata.get("crawl_only_content_backed_workbooks")
-        crawl_only_content_backed_workbooks = (
-            True if raw_flag is None else bool(raw_flag)
-        )
+        crawl_only_content_backed_workbooks = _to_bool(raw_flag, True)
         # fetch_snapshot is synchronous and blocks for hours on a large tenant.
         # Calling it directly wedged the worker's event loop, so the activity's
         # own heartbeat could not fire and the worker never observed its

@@ -31,6 +31,19 @@ class _RateLimiter:
         self._lock = threading.Lock()
         self._next_allowed = 0.0
 
+    def tighten_to(self, rpm: int) -> None:
+        """Adopt a MORE restrictive rate; never loosen.
+
+        The limiter protects the Omni host, so the most conservative rpm any
+        run asked for wins. Raising a host's rpm needs a worker restart. An
+        operator who sets rate_limit_rpm low because Omni is 429-ing must not
+        silently get an earlier run's higher rate.
+        """
+        interval = 60.0 / rpm if rpm and rpm > 0 else 0.0
+        with self._lock:
+            if interval > self.min_interval:
+                self.min_interval = interval
+
     def acquire(self) -> None:
         if self.min_interval <= 0:
             return
@@ -57,12 +70,17 @@ _HOST_RATE_LIMITERS_LOCK = threading.Lock()
 
 
 def _get_host_rate_limiter(base_url: str, rpm: int) -> _RateLimiter:
-    key = f"{base_url}|{rpm}"
+    # Keyed on the host alone: the limit belongs to the host, so two runs with
+    # different operator-configured rpm must not each get their own limiter and
+    # sum at Omni's door. The most restrictive rpm wins (see `tighten_to`).
+    key = base_url
     with _HOST_RATE_LIMITERS_LOCK:
         limiter = _HOST_RATE_LIMITERS.get(key)
         if limiter is None:
             limiter = _RateLimiter(rpm)
             _HOST_RATE_LIMITERS[key] = limiter
+        else:
+            limiter.tighten_to(rpm)
     return limiter
 
 
@@ -146,6 +164,13 @@ class ClientClass:
         self._abort: threading.Event | None = None
         # Per-run failure tallies. Reset at fetch_snapshot start.
         self._failures: dict[str, int] = {k: 0 for k in _FAILURE_CATEGORIES}
+        # Topic detail is a property of the OWNING model, not of each workbook
+        # that inherits it, so it is fetched once per (owning model, topic) and
+        # reused. Without this, every workbook re-fetches the same shared topic:
+        # one live run issued 25,831 topic-detail requests that resolved to 93
+        # distinct topics. Reset at fetch_snapshot start.
+        self._topic_detail_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._topic_detail_cache_lock = threading.Lock()
         if credentials:
             self.load_credentials(credentials)
 
@@ -545,7 +570,11 @@ class ClientClass:
                 else None
             )
             if detail is None:
-                detail = self._fetch_topic_detail(model_id, topic_name)
+                # `owning_model_id` — not `model_id`. When a workbook genuinely
+                # overrides the topic these are equal (see above), so overrides
+                # still fetch their own copy; when it merely inherits, every
+                # inheriting workbook shares one fetch.
+                detail = self._fetch_topic_detail_cached(owning_model_id, topic_name)
             topic.update(detail)
             topics.append(topic)
         return topics
@@ -774,6 +803,30 @@ class ClientClass:
             "viewSources": view_sources,
         }
 
+    def _fetch_topic_detail_cached(
+        self, owning_model_id: str, topic_name: str
+    ) -> dict[str, Any]:
+        """Memoized `_fetch_topic_detail`, keyed on the OWNING model.
+
+        Only successful (non-empty) results are cached: caching `{}` would let
+        one transient failure permanently blank that topic for every workbook
+        in the run, which is a worse trade than re-attempting it.
+
+        A benign race can let two threads fetch the same key concurrently; the
+        lock is not held across the request, because doing so would serialise
+        the whole pool behind one HTTP call.
+        """
+        key = (owning_model_id, topic_name)
+        with self._topic_detail_cache_lock:
+            hit = self._topic_detail_cache.get(key)
+        if hit is not None:
+            return hit
+        detail = self._fetch_topic_detail(owning_model_id, topic_name)
+        if detail:
+            with self._topic_detail_cache_lock:
+                self._topic_detail_cache[key] = detail
+        return detail
+
     def _fetch_topic_detail(self, model_id: str, topic_name: str) -> dict[str, Any]:
         """Fetch enriched topic data via the topic API. Returns {} on any error.
 
@@ -942,6 +995,7 @@ class ClientClass:
         self._abort = abort
         # Reset per-run failure counters.
         self._failures = {k: 0 for k in _FAILURE_CATEGORIES}
+        self._topic_detail_cache = {}
         connections = self.list_connections()
         logger.info(f"fetch_snapshot: {len(connections)} connections")
 
@@ -1003,6 +1057,22 @@ class ClientClass:
         # `omniV01BaseModel` edge behave exactly as before); the transformer
         # is the second gate that keeps content-less workbook ENTITIES out of
         # the catalog. Both gates share the same predicate for consistency.
+        # Document-detail failures leave document_model_ids INCOMPLETE, and the
+        # aggressive filter deletes any WORKBOOK absent from that set — so an
+        # incomplete set silently drops real, named workbooks while the run still
+        # reports success. Fail open: fall back to the conservative filter
+        # (unnamed content-less workbooks only) rather than deleting models on
+        # incomplete evidence.
+        doc_failures = self._failures.get("document_detail", 0)
+        if doc_failures and crawl_only_content_backed_workbooks:
+            logger.warning(
+                f"document-detail fetch failed for {doc_failures}/{len(documents)} "
+                f"documents; document_model_ids is incomplete. Degrading "
+                f"crawl_only_content_backed_workbooks to False for this run so "
+                f"named workbooks are not dropped on incomplete evidence."
+            )
+            crawl_only_content_backed_workbooks = False
+
         topic_models = [
             m for m in models
             if not self._is_workbook_without_content(
@@ -1026,9 +1096,18 @@ class ClientClass:
                 topics.extend(future.result())
                 done_models += 1
                 if done_models % 5 == 0 or done_models == total_models:
+                    # Failure tallies ride the progress line. The end-of-pass
+                    # `fetch_snapshot failures:` summary below is never reached
+                    # by a run that times out mid-pass — which is exactly the
+                    # run whose failure counts you need.
                     logger.info(
                         f"fetch_snapshot progress: models {done_models}/{total_models}, "
-                        f"topics_so_far={len(topics)}"
+                        f"topics_so_far={len(topics)}, "
+                        f"topic_detail_cached={len(self._topic_detail_cache)}, "
+                        f"failures={{"
+                        f"model_yaml={self._failures['model_yaml']}, "
+                        f"topic_detail={self._failures['topic_detail']}, "
+                        f"document_detail={self._failures['document_detail']}}}"
                     )
 
         # Threshold check: abort BEFORE the transformer runs if the model pass

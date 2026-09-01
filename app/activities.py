@@ -19,6 +19,22 @@ logger = get_logger(__name__)
 activity.logger = logger
 
 
+# Argo passes workflow parameters as STRINGS, so the operator setting a flag to
+# "false" arrives as the string "false" — and bool("false") is True. Every
+# boolean read off the form/state path must go through this. "null" is in the
+# falsey set because the app already treats the literal string "null" as a
+# sentinel elsewhere (activities.py, handler.py).
+_FALSEY = ("false", "0", "no", "off", "null", "none", "")
+
+
+def _to_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in _FALSEY
+
+
 class ActivitiesClass(ActivitiesInterface):
     def __init__(self, handler: HandlerClass | None = None):
         self.handler = handler or HandlerClass()
@@ -134,14 +150,14 @@ class ActivitiesClass(ActivitiesInterface):
         # /v1/documents) cuts ~90% of API traffic on tenants like the one
         # with 19,937 models where most are ephemeral sessions.
         aggressive_raw = _form_value("crawl_only_content_backed_workbooks")
-        aggressive_workbook_filter = True if aggressive_raw is None else bool(aggressive_raw)
+        aggressive_workbook_filter = _to_bool(aggressive_raw, True)
 
         metadata: dict[str, Any] = {
             "page_size": _to_int(page_size_raw, 100),
             "max_pages": _to_int(max_pages_raw, None),
             "connection_epoch_ms": connection_epoch_ms,
             "output_file": _form_value("output_file") or "omni_entities.ndjson",
-            "save_output_local": False if save_output_raw is None else bool(save_output_raw),
+            "save_output_local": _to_bool(save_output_raw, False),
             "max_concurrency": _to_int(max_concurrency_raw, 10),
             "atlan_source_connection_map": atlan_source_connection_map,
             "crawl_only_content_backed_workbooks": aggressive_workbook_filter,
@@ -150,7 +166,7 @@ class ActivitiesClass(ActivitiesInterface):
         credentials = {
             "omni_base_url": _form_value("omni_base_url"),
             "omni_api_token": _form_value("omni_api_token"),
-            "verify_ssl": True if verify_ssl_raw is None else bool(verify_ssl_raw),
+            "verify_ssl": _to_bool(verify_ssl_raw, True),
             "timeout_seconds": _to_int(timeout_raw, 30),
             "rate_limit_rpm": _to_int(_form_value("rate_limit_rpm"), 60),
         }
