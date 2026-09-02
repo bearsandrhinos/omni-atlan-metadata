@@ -537,6 +537,15 @@ class ClientClass:
         kind = str(model.get("modelKind") or "").upper()
         base_model_id = model.get("baseModelId")
         is_workbook = kind == "WORKBOOK" and bool(base_model_id)
+        # The override probe is genuinely workbook-only: `mode=extension` is a
+        # workbook concept. Climbing to the SHARED owner is NOT — SHARED_EXTENSION
+        # and BRANCH are equally unrepresentable as OmniV01Model (see
+        # `_walk_to_shared_owner`, whose docstring says it handles them), so their
+        # inherited topics must be attributed to the SHARED ancestor too. Gating
+        # the climb on WORKBOOK meant those kinds silently owned their inherited
+        # topics: on one measured crawl only 148 of 1,850 models (8%) ever
+        # reached the walk.
+        inherits_topics = bool(base_model_id) and kind != "SHARED"
         overridden = self._overridden_topic_names(model_id) if is_workbook else None
 
         topics: list[dict[str, Any]] = []
@@ -575,7 +584,7 @@ class ClientClass:
             genuinely_overridden = (
                 is_workbook and overridden is not None and topic_name in overridden
             )
-            if is_workbook and not genuinely_overridden:
+            if inherits_topics and not genuinely_overridden:
                 owning_model_id = self._walk_to_shared_owner(model_id)
             else:
                 owning_model_id = model_id
