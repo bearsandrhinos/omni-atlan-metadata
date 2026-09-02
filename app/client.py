@@ -685,32 +685,38 @@ class ClientClass:
     def _views_from_payload(files: dict[str, Any]) -> dict[str, dict[str, Any]]:
         """Parse the `.view` files carried in a combined-mode YAML payload.
 
-        Registered under EVERY form a topic might reference the view by, because
-        the two identifiers genuinely differ:
+        Registered under every form a topic may reference the view by, because
+        the file key and the reference genuinely differ. Measured against a live
+        Omni org:
 
-        - view FILES are keyed "<CATALOG>.<SCHEMA>/<view_name>.view", e.g.
-          "WIDE_WORLD_IMPORTERS.PROCESSED_GOLD/dim_customer.view", and the view
-          body's `name` is implicit in that (bare) file name;
-        - topic YAML references views by their schema-namespaced internal name,
-          `<schema>__<view_name>` — e.g. `base_view: processed_gold__dim_customer`,
-          and the same form as `joins` keys.
+        | file key                                             | topic reference                                  |
+        |------------------------------------------------------|--------------------------------------------------|
+        | `WIDE_WORLD_IMPORTERS.PROCESSED_GOLD/dim_customer.view` | `wide_world_importers_processed_gold__dim_customer` |
+        | `DEMO/account.view`                                  | `demo__account`                                  |
+        | `user_order_facts.query.view`                         | `user_order_facts`                               |
 
-        Registering only the bare stem is why local derivation used to miss on
-        every schema-namespaced org and fall through to the per-topic API: one
-        unresolvable name dumps the WHOLE topic to the API, and `base_view` is a
-        required topic parameter, so it fired on 100% of topics. A crawl of one
-        large org fell back for 20,692 of 20,693 topics.
+        So the reference is the full directory path lower-cased with `.` turned
+        into `_`, then `__`, then the stem — and a `.query` (or any dotted)
+        suffix on the stem is dropped. View bodies carry no `name` at all, so
+        the file key is the only source.
 
-        Registration is additive and lower-cased on lookup, so an org that does
-        reference views bare keeps working exactly as before.
+        Registering only the bare stem is why local derivation missed on every
+        schema-namespaced org and fell through to the per-topic API: one
+        unresolvable name abandons the WHOLE topic, and `base_view` is a
+        required topic parameter, so it fired on effectively every topic. One
+        measured crawl fell back for 20,692 of 20,693 topics.
+
+        Registration is additive — an org that references views bare is
+        unaffected.
         """
         views: dict[str, dict[str, Any]] = {}
 
         def _register(key: Any, parsed: dict[str, Any]) -> None:
             if not key:
                 return
-            views.setdefault(str(key), parsed)
-            views.setdefault(str(key).lower(), parsed)
+            text = str(key)
+            views.setdefault(text, parsed)
+            views.setdefault(text.lower(), parsed)
 
         for file_name, file_content in files.items():
             if not file_name.endswith(".view"):
@@ -723,20 +729,28 @@ class ClientClass:
                 continue
 
             path = file_name.removesuffix(".view")
-            stem = path.split("/")[-1]
-            # "<CATALOG>.<SCHEMA>/<view>" -> schema is the last dot-segment of
-            # the directory; a bare "<view>" has no directory and no schema.
-            directory = path.rsplit("/", 1)[0] if "/" in path else ""
-            schema = directory.rsplit(".", 1)[-1] if directory else ""
+            if "/" in path:
+                directory, stem = path.rsplit("/", 1)
+            else:
+                directory, stem = "", path
+
+            # "opportunity_facts.query" is referenced as "opportunity_facts"
+            stems = {stem}
+            if "." in stem:
+                stems.add(stem.split(".", 1)[0])
+
+            # "WIDE_WORLD_IMPORTERS.PROCESSED_GOLD" -> "wide_world_importers_processed_gold"
+            prefixes = set()
+            if directory:
+                prefixes.add(directory.replace(".", "_"))
+                # the trailing segment alone, for orgs that namespace by schema only
+                prefixes.add(directory.rsplit(".", 1)[-1])
 
             _register(parsed.get("name"), parsed)
-            _register(stem, parsed)
-            if schema:
-                _register(f"{schema}__{stem}", parsed)
-                # the body's own schema/name pair, when it carries one
-                body_schema = parsed.get("schema")
-                if body_schema:
-                    _register(f"{body_schema}__{stem}", parsed)
+            for st in stems:
+                _register(st, parsed)
+                for pref in prefixes:
+                    _register(f"{pref}__{st}", parsed)
         return views
 
     @staticmethod

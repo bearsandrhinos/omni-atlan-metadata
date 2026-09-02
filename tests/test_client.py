@@ -969,28 +969,6 @@ _VIEW_ORDERS = "name: order_items\ntable_name: ORDER_ITEMS\nschema: ECOMM\ncatal
 _VIEW_USERS = "name: users\ntable_name: USERS\nschema: ECOMM\ncatalog: PROD\n"
 
 
-def test_schema_namespaced_topic_derives_locally():
-    """Omni's documented shape: refs are `ecomm__x`, files are `ECOMM/x.view`."""
-    client = make_client()
-    files = {
-        "PROD.ECOMM/order_items.view": _VIEW_ORDERS,
-        "PROD.ECOMM/users.view": _VIEW_USERS,
-    }
-    views = client._views_from_payload(files)
-    parsed = {"name": "orders", "base_view": "ecomm__order_items",
-              "joins": {"ecomm__users": {}}}
-
-    detail = client._topic_detail_from_views(parsed, "ecomm__order_items", views, {})
-
-    assert detail is not None, (
-        "schema-namespaced refs fell through to the topic API -- this is the "
-        "20,692-of-20,693 fallback"
-    )
-    assert detail["sourceTableName"] == "ORDER_ITEMS"
-    assert detail["sourceSchema"] == "ECOMM"
-    assert len(detail["viewSources"]) == 2
-
-
 def test_bare_reference_still_derives_locally():
     """Control: an org that references views bare keeps working unchanged."""
     client = make_client()
@@ -1002,30 +980,6 @@ def test_bare_reference_still_derives_locally():
     detail = client._topic_detail_from_views(parsed, "order_items", views, {})
     assert detail is not None
     assert detail["sourceTableName"] == "ORDER_ITEMS"
-
-
-def test_base_view_alone_is_enough_to_force_the_api():
-    """`base_view` is required on every topic, so an unresolvable base view
-    fails the topic regardless of join structure. Guards the 100% blast radius."""
-    client = make_client()
-    views = client._views_from_payload({"PROD.ECOMM/order_items.view": _VIEW_ORDERS})
-
-    # resolvable base view, no joins -> derives
-    assert client._topic_detail_from_views(
-        {"base_view": "ecomm__order_items"}, "ecomm__order_items", views, {}
-    ) is not None
-
-    # genuinely absent view -> still correctly gives up
-    assert client._topic_detail_from_views(
-        {"base_view": "nowhere__missing"}, "nowhere__missing", views, {}
-    ) is None
-
-
-def test_views_registered_under_every_reference_form():
-    client = make_client()
-    views = client._views_from_payload({"PROD.ECOMM/order_items.view": _VIEW_ORDERS})
-    for key in ("order_items", "ECOMM__order_items", "ecomm__order_items"):
-        assert key in views, f"view not registered under {key!r}"
 
 
 def test_module_imports():
@@ -1045,3 +999,80 @@ def test_single_document_failure_does_not_widen_the_crawl():
     assert 0 < _DOCUMENT_DETAIL_DEGRADE_THRESHOLD < 1
     assert (1 / 263) < _DOCUMENT_DETAIL_DEGRADE_THRESHOLD    # 1 flaky doc: tolerate
     assert (50 / 263) > _DOCUMENT_DETAIL_DEGRADE_THRESHOLD   # observed 19%: degrade
+
+
+# ---------------------------------------------------------------------------
+# View-reference forms, measured against a live Omni org (2026-09-01).
+#
+#   file key                                                topic reference
+#   WIDE_WORLD_IMPORTERS.PROCESSED_GOLD/dim_customer.view   wide_world_importers_processed_gold__dim_customer
+#   DEMO/account.view                                       demo__account
+#   user_order_facts.query.view                             user_order_facts
+#
+# The reference is the directory path lower-cased with "." -> "_", then "__",
+# then the stem, with a dotted suffix on the stem dropped. View bodies carry no
+# `name` at all, so the file key is the only source.
+# ---------------------------------------------------------------------------
+
+_VIEW_BODY = "schema: PROCESSED_GOLD\ntable_name: DIM_CUSTOMER\ncatalog: WWI\n"
+
+_LIVE_FORMS = [
+    ("WIDE_WORLD_IMPORTERS.PROCESSED_GOLD/dim_customer.view",
+     "wide_world_importers_processed_gold__dim_customer"),
+    ("wide_world_importers.processed_gold/dim_customer.view",
+     "wide_world_importers_processed_gold__dim_customer"),
+    ("DEMO/account.view", "demo__account"),
+    ("ECOMM/order_items.view", "ecomm__order_items"),
+    ("user_order_facts.query.view", "user_order_facts"),
+    ("order_items.view", "order_items"),
+]
+
+
+@pytest.mark.parametrize("file_key,reference", _LIVE_FORMS)
+def test_live_view_reference_forms_resolve(file_key, reference):
+    """Every reference form observed on a real org must resolve to its view."""
+    views = ClientClass._views_from_payload({file_key: _VIEW_BODY})
+    assert reference in views, (
+        f"{reference!r} does not resolve to {file_key!r} -- local derivation "
+        f"will fall through to the per-topic API for every topic using it"
+    )
+
+
+def test_full_directory_prefix_not_just_schema_segment():
+    """Regression guard: the first cut used only the last dot-segment of the
+    directory, which misses the two-part catalog.schema form entirely."""
+    views = ClientClass._views_from_payload(
+        {"WIDE_WORLD_IMPORTERS.PROCESSED_GOLD/dim_customer.view": _VIEW_BODY}
+    )
+    assert "wide_world_importers_processed_gold__dim_customer" in views
+    # the schema-only form is registered too, harmlessly
+    assert "processed_gold__dim_customer" in views
+
+
+def test_schema_namespaced_topic_derives_without_api():
+    """End to end: a topic whose base_view is schema-namespaced derives locally."""
+    client = make_client()
+    files = {
+        "ECOMM/order_items.view":
+            "schema: ECOMM\ntable_name: ORDER_ITEMS\ncatalog: PROD\n",
+        "ECOMM/users.view":
+            "schema: ECOMM\ntable_name: USERS\ncatalog: PROD\n",
+    }
+    views = client._views_from_payload(files)
+    parsed = {"name": "order_items_embed", "base_view": "ecomm__order_items",
+              "joins": {"ecomm__users": {}}}
+
+    detail = client._topic_detail_from_views(parsed, "ecomm__order_items", views, {})
+
+    assert detail is not None, "fell through to the per-topic API"
+    assert detail["sourceTableName"] == "ORDER_ITEMS"
+    assert len(detail["viewSources"]) == 2
+
+
+def test_genuinely_absent_view_still_gives_up():
+    """The fix must not paper over a view that really is missing."""
+    client = make_client()
+    views = client._views_from_payload({"ECOMM/order_items.view": _VIEW_BODY})
+    assert client._topic_detail_from_views(
+        {"base_view": "nowhere__missing"}, "nowhere__missing", views, {}
+    ) is None
