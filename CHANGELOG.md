@@ -4,6 +4,56 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Topic detail is now derived locally on schema-namespaced orgs.** Topic YAML
+  references views by their internal `<schema>__<view>` name, while the view
+  files are keyed `<CATALOG>.<SCHEMA>/<view>.view`. `_views_from_payload`
+  registered only the bare stem, so every lookup missed — and because one
+  unresolvable reference gives up on the whole topic, and `base_view` is a
+  required topic parameter, it fired on effectively every topic. A crawl of one
+  large org fell back to the per-topic API for 20,692 of 20,693 topics, which at
+  the client's 1 req/s gate is the difference between a crawl that finishes and
+  one that does not. Views are now registered under every form a topic may
+  reference them by; the change is additive, so orgs that reference views bare
+  are unaffected.
+
+- **Topic detail is fetched against the owning model and memoized.** The owning
+  shared model was computed and then discarded, with the workbook's own id used
+  for the fetch. Where the owning model does not carry the topic — a
+  `BRANCH`-defined topic, or a failed override probe — the fetch falls back to
+  the model itself rather than silently returning empty enrichment.
+
+- **`crawl_only_content_backed_workbooks` can be turned off.** Argo passes
+  workflow parameters as strings and `bool("false")` is `True`. The same
+  coercion bug affected `save_output_local` and `verify_ssl`; a silently ignored
+  `verify_ssl=false` is security-relevant.
+
+- **Incomplete document evidence no longer deletes named workbooks.** When
+  document-detail fetches fail beyond a threshold, `document_model_ids` is too
+  incomplete to filter on, so the aggressive workbook filter degrades to the
+  conservative one for that run instead of dropping real workbooks while
+  reporting success. Thresholded so a single transient failure cannot widen the
+  crawl from ~10% of models to 100%.
+
+- **The shared host rate limiter can only ratchet down.** Keying it on
+  `<base_url>|<rpm>` gave two runs with different configured rpm their own
+  limiter, which summed at the host. It is now keyed on the host, and the most
+  conservative rpm any run asked for wins.
+
+- **`typedefs.py` matches the served typedef.** Attribute names lacked the
+  `omniV01` prefix; the derived-models relationship also had the wrong category
+  and was missing containment. Inert wherever typedefs are pre-seeded, which is
+  why it went unnoticed.
+
+### Changed
+
+- Failure tallies now ride the periodic progress line. The end-of-pass
+  `fetch_snapshot failures:` summary is never reached by a run that times out
+  mid-pass, which is exactly the run whose failure counts are wanted.
+
 ## [0.4.0] - 2026-08-26
 
 Six fixes surfaced by Atlan's live-run review of v0.3.0 on the customer

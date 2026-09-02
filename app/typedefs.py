@@ -97,10 +97,6 @@ _OMNI_V01_ATTRS: list[AttributeDef] = [
         indexed=True,
         description="Omni-side stable identifier. Required round-trip handle.",
     ),
-    _str(
-        indexed=False,
-        description="Direct deep-link back to the asset in Omni's UI.",
-    ),
     _enum(
         "omniV01Scope",
         "OmniV01Scope",

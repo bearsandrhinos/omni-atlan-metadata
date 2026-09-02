@@ -915,3 +915,133 @@ def test_host_rate_limiter_ratchets_down_never_up():
 
     limiter.tighten_to(0)           # rpm=0 must never disable it
     assert limiter.min_interval == pytest.approx(6.0)
+
+
+# ---------------------------------------------------------------------------
+# The call site, not the memo dict.
+#
+# The first cut of these tests stubbed _fetch_topic_detail and called the cache
+# wrapper directly, which asserts that a dict memoizes. Reverting the call site
+# to model_id left the whole suite green. These drive _fetch_topics_for_model
+# and assert on the URLs actually requested, so they fail if it reverts.
+# ---------------------------------------------------------------------------
+
+def _payload(files: dict) -> dict:
+    return {"files": files}
+
+
+def test_module_imports():
+    """typedefs.py has no importer in-tree, so nothing else catches a syntax
+    or signature error in it."""
+    import app.typedefs  # noqa: F401
+    import app.client    # noqa: F401
+    import app.activities  # noqa: F401
+    import app.handler  # noqa: F401
+
+
+def test_single_document_failure_does_not_widen_the_crawl():
+    """One transient document-detail failure must not flip the workbook filter
+    off -- that widens the crawl from ~10% of models to 100%."""
+    from app.client import _DOCUMENT_DETAIL_DEGRADE_THRESHOLD
+
+    assert 0 < _DOCUMENT_DETAIL_DEGRADE_THRESHOLD < 1
+    # 1 failure in 263 documents is 0.38% -- must stay below the threshold.
+    assert (1 / 263) < _DOCUMENT_DETAIL_DEGRADE_THRESHOLD
+    # The observed 50-in-263 (19%) must exceed it and degrade.
+    assert (50 / 263) > _DOCUMENT_DETAIL_DEGRADE_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Schema-namespaced view references.
+#
+# Omni topic YAML names views by their internal `<schema>__<view>` reference,
+# while the view FILES are keyed "<CATALOG>.<SCHEMA>/<view>.view". Keying the
+# parsed views on the bare stem alone missed every lookup, and because one
+# unresolvable name dumps the WHOLE topic to the per-topic API -- and
+# `base_view` is a required topic parameter -- it fired on 100% of topics.
+# One measured crawl fell back for 20,692 of 20,693 topics.
+#
+# These assert on DERIVATION SUCCEEDING, which is the invariant; they do not
+# care how the lookup is implemented.
+# ---------------------------------------------------------------------------
+
+_VIEW_ORDERS = "name: order_items\ntable_name: ORDER_ITEMS\nschema: ECOMM\ncatalog: PROD\n"
+_VIEW_USERS = "name: users\ntable_name: USERS\nschema: ECOMM\ncatalog: PROD\n"
+
+
+def test_schema_namespaced_topic_derives_locally():
+    """Omni's documented shape: refs are `ecomm__x`, files are `ECOMM/x.view`."""
+    client = make_client()
+    files = {
+        "PROD.ECOMM/order_items.view": _VIEW_ORDERS,
+        "PROD.ECOMM/users.view": _VIEW_USERS,
+    }
+    views = client._views_from_payload(files)
+    parsed = {"name": "orders", "base_view": "ecomm__order_items",
+              "joins": {"ecomm__users": {}}}
+
+    detail = client._topic_detail_from_views(parsed, "ecomm__order_items", views, {})
+
+    assert detail is not None, (
+        "schema-namespaced refs fell through to the topic API -- this is the "
+        "20,692-of-20,693 fallback"
+    )
+    assert detail["sourceTableName"] == "ORDER_ITEMS"
+    assert detail["sourceSchema"] == "ECOMM"
+    assert len(detail["viewSources"]) == 2
+
+
+def test_bare_reference_still_derives_locally():
+    """Control: an org that references views bare keeps working unchanged."""
+    client = make_client()
+    files = {"order_items.view": _VIEW_ORDERS, "users.view": _VIEW_USERS}
+    views = client._views_from_payload(files)
+    parsed = {"name": "orders", "base_view": "order_items",
+              "joins": {"users": {}}}
+
+    detail = client._topic_detail_from_views(parsed, "order_items", views, {})
+    assert detail is not None
+    assert detail["sourceTableName"] == "ORDER_ITEMS"
+
+
+def test_base_view_alone_is_enough_to_force_the_api():
+    """`base_view` is required on every topic, so an unresolvable base view
+    fails the topic regardless of join structure. Guards the 100% blast radius."""
+    client = make_client()
+    views = client._views_from_payload({"PROD.ECOMM/order_items.view": _VIEW_ORDERS})
+
+    # resolvable base view, no joins -> derives
+    assert client._topic_detail_from_views(
+        {"base_view": "ecomm__order_items"}, "ecomm__order_items", views, {}
+    ) is not None
+
+    # genuinely absent view -> still correctly gives up
+    assert client._topic_detail_from_views(
+        {"base_view": "nowhere__missing"}, "nowhere__missing", views, {}
+    ) is None
+
+
+def test_views_registered_under_every_reference_form():
+    client = make_client()
+    views = client._views_from_payload({"PROD.ECOMM/order_items.view": _VIEW_ORDERS})
+    for key in ("order_items", "ECOMM__order_items", "ecomm__order_items"):
+        assert key in views, f"view not registered under {key!r}"
+
+
+def test_module_imports():
+    """typedefs.py has no in-tree importer, so nothing else catches a signature
+    error in it -- a removed attribute once left an orphaned _str() call."""
+    import app.typedefs  # noqa: F401
+    import app.client  # noqa: F401
+    import app.activities  # noqa: F401
+    import app.handler  # noqa: F401
+
+
+def test_single_document_failure_does_not_widen_the_crawl():
+    """One transient document-detail failure must not flip the workbook filter
+    off -- that widens the crawl from ~10% of models to 100%."""
+    from app.client import _DOCUMENT_DETAIL_DEGRADE_THRESHOLD
+
+    assert 0 < _DOCUMENT_DETAIL_DEGRADE_THRESHOLD < 1
+    assert (1 / 263) < _DOCUMENT_DETAIL_DEGRADE_THRESHOLD    # 1 flaky doc: tolerate
+    assert (50 / 263) > _DOCUMENT_DETAIL_DEGRADE_THRESHOLD   # observed 19%: degrade

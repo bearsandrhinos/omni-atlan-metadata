@@ -146,6 +146,36 @@ _FAILURE_CATEGORIES = (
 # be inconsistent anyway. Checked in fetch_snapshot with maximum_attempts=1
 # in mind: a late abort costs a full re-crawl.
 _MODEL_YAML_FAILURE_ABORT_THRESHOLD = 0.20
+# Above this share of failed document-detail fetches, document_model_ids is
+# too incomplete to safely delete workbooks, so the aggressive filter is
+# degraded for the run. Below it, the odd transient failure is tolerated.
+_DOCUMENT_DETAIL_DEGRADE_THRESHOLD = 0.02
+
+
+def _resolve_view(
+    views: dict[str, Any], aliases: dict[str, str], name: str | None
+) -> dict[str, Any] | None:
+    """Resolve a topic's view reference against the parsed `.view` files.
+
+    Topic YAML may name a view by its bare name, by its schema-namespaced
+    internal name (`<schema>__<view>`), or by a relationship alias. Case can
+    differ from the file path, which is upper-cased. Try each in turn.
+    """
+    if not name:
+        return None
+    for candidate in (name, name.lower()):
+        view = views.get(candidate)
+        if isinstance(view, dict):
+            return view
+    for candidate in (name, name.lower()):
+        target = aliases.get(candidate)
+        if not target:
+            continue
+        for resolved in (target, target.lower()):
+            view = views.get(resolved)
+            if isinstance(view, dict):
+                return view
+    return None
 
 
 class ClientClass:
@@ -575,6 +605,15 @@ class ClientClass:
                 # still fetch their own copy; when it merely inherits, every
                 # inheriting workbook shares one fetch.
                 detail = self._fetch_topic_detail_cached(owning_model_id, topic_name)
+                # ...but the walk deliberately climbs PAST SHARED_EXTENSION and
+                # BRANCH layers, so the ancestor may not own this topic at all
+                # (a BRANCH-defined topic, or an override probe that failed and
+                # defaulted to "inherited"). That 404s, and the swallow would
+                # turn it into {} — silently dropping source lineage and
+                # dimension/measure names with the run still reporting success.
+                # Retry against the model itself; costs a request only on miss.
+                if not detail and owning_model_id != model_id:
+                    detail = self._fetch_topic_detail_cached(model_id, topic_name)
             topic.update(detail)
             topics.append(topic)
         return topics
@@ -637,13 +676,33 @@ class ClientClass:
     def _views_from_payload(files: dict[str, Any]) -> dict[str, dict[str, Any]]:
         """Parse the `.view` files carried in a combined-mode YAML payload.
 
-        Keyed on the bare view name. Observed filename convention is
-        "<CATALOG>.<SCHEMA>/<view_name>.view" (e.g.
-        "WIDE_WORLD_IMPORTERS.PROCESSED_GOLD/dim_customer.view"); the directory
-        prefix only restates catalog/schema, both of which the view body also
-        carries, so the stem is all we need for lookup.
+        Registered under EVERY form a topic might reference the view by, because
+        the two identifiers genuinely differ:
+
+        - view FILES are keyed "<CATALOG>.<SCHEMA>/<view_name>.view", e.g.
+          "WIDE_WORLD_IMPORTERS.PROCESSED_GOLD/dim_customer.view", and the view
+          body's `name` is implicit in that (bare) file name;
+        - topic YAML references views by their schema-namespaced internal name,
+          `<schema>__<view_name>` — e.g. `base_view: processed_gold__dim_customer`,
+          and the same form as `joins` keys.
+
+        Registering only the bare stem is why local derivation used to miss on
+        every schema-namespaced org and fall through to the per-topic API: one
+        unresolvable name dumps the WHOLE topic to the API, and `base_view` is a
+        required topic parameter, so it fired on 100% of topics. A crawl of one
+        large org fell back for 20,692 of 20,693 topics.
+
+        Registration is additive and lower-cased on lookup, so an org that does
+        reference views bare keeps working exactly as before.
         """
         views: dict[str, dict[str, Any]] = {}
+
+        def _register(key: Any, parsed: dict[str, Any]) -> None:
+            if not key:
+                return
+            views.setdefault(str(key), parsed)
+            views.setdefault(str(key).lower(), parsed)
+
         for file_name, file_content in files.items():
             if not file_name.endswith(".view"):
                 continue
@@ -653,8 +712,22 @@ class ClientClass:
                 continue
             if not isinstance(parsed, dict):
                 continue
-            stem = file_name.removesuffix(".view").split("/")[-1]
-            views[str(parsed.get("name") or stem)] = parsed
+
+            path = file_name.removesuffix(".view")
+            stem = path.split("/")[-1]
+            # "<CATALOG>.<SCHEMA>/<view>" -> schema is the last dot-segment of
+            # the directory; a bare "<view>" has no directory and no schema.
+            directory = path.rsplit("/", 1)[0] if "/" in path else ""
+            schema = directory.rsplit(".", 1)[-1] if directory else ""
+
+            _register(parsed.get("name"), parsed)
+            _register(stem, parsed)
+            if schema:
+                _register(f"{schema}__{stem}", parsed)
+                # the body's own schema/name pair, when it carries one
+                body_schema = parsed.get("schema")
+                if body_schema:
+                    _register(f"{body_schema}__{stem}", parsed)
         return views
 
     @staticmethod
@@ -765,10 +838,7 @@ class ClientClass:
         aliases = view_aliases or {}
         view_sources: list[dict[str, Any]] = []
         for view_name in ordered:
-            view = views.get(view_name)
-            if not isinstance(view, dict) and view_name in aliases:
-                # `joins` named a relationship alias; resolve to the real view.
-                view = views.get(aliases[view_name])
+            view = _resolve_view(views, aliases, view_name)
             if not isinstance(view, dict):
                 # Still unresolvable — an alias we could not map, or a view absent
                 # from the payload. Give up on local derivation for this topic so
@@ -789,9 +859,7 @@ class ClientClass:
                 }
             )
         base_view = (
-            views.get(base_view_name)
-            or views.get(aliases.get(base_view_name or "", ""))
-            or {}
+            _resolve_view(views, aliases, base_view_name) or {}
         ) if base_view_name else {}
         return {
             "sourceTableName": base_view.get("table_name"),
@@ -1063,8 +1131,15 @@ class ClientClass:
         # reports success. Fail open: fall back to the conservative filter
         # (unnamed content-less workbooks only) rather than deleting models on
         # incomplete evidence.
+        # Thresholded, not any-failure: flipping this off widens the crawl from
+        # ~10% of models to 100%, so a single transient 500 among thousands of
+        # documents must not do it. Mirrors _MODEL_YAML_FAILURE_ABORT_THRESHOLD.
         doc_failures = self._failures.get("document_detail", 0)
-        if doc_failures and crawl_only_content_backed_workbooks:
+        doc_failure_rate = doc_failures / max(len(documents), 1)
+        if (
+            doc_failure_rate > _DOCUMENT_DETAIL_DEGRADE_THRESHOLD
+            and crawl_only_content_backed_workbooks
+        ):
             logger.warning(
                 f"document-detail fetch failed for {doc_failures}/{len(documents)} "
                 f"documents; document_model_ids is incomplete. Degrading "
