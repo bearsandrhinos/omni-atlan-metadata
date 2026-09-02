@@ -43,11 +43,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   limiter, which summed at the host. It is now keyed on the host, and the most
   conservative rpm any run asked for wins.
 
-- **`typedefs.py` matches the served typedef.** Attribute names lacked the
-  `omniV01` prefix; the derived-models relationship also had the wrong category
-  and was missing containment. Inert wherever typedefs are pre-seeded, which is
-  why it went unnoticed.
-
 ### Changed
 
 - Failure tallies now ride the periodic progress line. The end-of-pass
