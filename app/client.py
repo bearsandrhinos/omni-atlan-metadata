@@ -31,6 +31,19 @@ class _RateLimiter:
         self._lock = threading.Lock()
         self._next_allowed = 0.0
 
+    def tighten_to(self, rpm: int) -> None:
+        """Adopt a MORE restrictive rate; never loosen.
+
+        The limiter protects the Omni host, so the most conservative rpm any
+        run asked for wins. Raising a host's rpm needs a worker restart. An
+        operator who sets rate_limit_rpm low because Omni is 429-ing must not
+        silently get an earlier run's higher rate.
+        """
+        interval = 60.0 / rpm if rpm and rpm > 0 else 0.0
+        with self._lock:
+            if interval > self.min_interval:
+                self.min_interval = interval
+
     def acquire(self) -> None:
         if self.min_interval <= 0:
             return
@@ -57,12 +70,17 @@ _HOST_RATE_LIMITERS_LOCK = threading.Lock()
 
 
 def _get_host_rate_limiter(base_url: str, rpm: int) -> _RateLimiter:
-    key = f"{base_url}|{rpm}"
+    # Keyed on the host alone: the limit belongs to the host, so two runs with
+    # different operator-configured rpm must not each get their own limiter and
+    # sum at Omni's door. The most restrictive rpm wins (see `tighten_to`).
+    key = base_url
     with _HOST_RATE_LIMITERS_LOCK:
         limiter = _HOST_RATE_LIMITERS.get(key)
         if limiter is None:
             limiter = _RateLimiter(rpm)
             _HOST_RATE_LIMITERS[key] = limiter
+        else:
+            limiter.tighten_to(rpm)
     return limiter
 
 
@@ -128,6 +146,36 @@ _FAILURE_CATEGORIES = (
 # be inconsistent anyway. Checked in fetch_snapshot with maximum_attempts=1
 # in mind: a late abort costs a full re-crawl.
 _MODEL_YAML_FAILURE_ABORT_THRESHOLD = 0.20
+# Above this share of failed document-detail fetches, document_model_ids is
+# too incomplete to safely delete workbooks, so the aggressive filter is
+# degraded for the run. Below it, the odd transient failure is tolerated.
+_DOCUMENT_DETAIL_DEGRADE_THRESHOLD = 0.02
+
+
+def _resolve_view(
+    views: dict[str, Any], aliases: dict[str, str], name: str | None
+) -> dict[str, Any] | None:
+    """Resolve a topic's view reference against the parsed `.view` files.
+
+    Topic YAML may name a view by its bare name, by its schema-namespaced
+    internal name (`<schema>__<view>`), or by a relationship alias. Case can
+    differ from the file path, which is upper-cased. Try each in turn.
+    """
+    if not name:
+        return None
+    for candidate in (name, name.lower()):
+        view = views.get(candidate)
+        if isinstance(view, dict):
+            return view
+    for candidate in (name, name.lower()):
+        target = aliases.get(candidate)
+        if not target:
+            continue
+        for resolved in (target, target.lower()):
+            view = views.get(resolved)
+            if isinstance(view, dict):
+                return view
+    return None
 
 
 class ClientClass:
@@ -146,6 +194,13 @@ class ClientClass:
         self._abort: threading.Event | None = None
         # Per-run failure tallies. Reset at fetch_snapshot start.
         self._failures: dict[str, int] = {k: 0 for k in _FAILURE_CATEGORIES}
+        # Topic detail is a property of the OWNING model, not of each workbook
+        # that inherits it, so it is fetched once per (owning model, topic) and
+        # reused. Without this, every workbook re-fetches the same shared topic:
+        # one live run issued 25,831 topic-detail requests that resolved to 93
+        # distinct topics. Reset at fetch_snapshot start.
+        self._topic_detail_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._topic_detail_cache_lock = threading.Lock()
         if credentials:
             self.load_credentials(credentials)
 
@@ -482,6 +537,15 @@ class ClientClass:
         kind = str(model.get("modelKind") or "").upper()
         base_model_id = model.get("baseModelId")
         is_workbook = kind == "WORKBOOK" and bool(base_model_id)
+        # The override probe is genuinely workbook-only: `mode=extension` is a
+        # workbook concept. Climbing to the SHARED owner is NOT — SHARED_EXTENSION
+        # and BRANCH are equally unrepresentable as OmniV01Model (see
+        # `_walk_to_shared_owner`, whose docstring says it handles them), so their
+        # inherited topics must be attributed to the SHARED ancestor too. Gating
+        # the climb on WORKBOOK meant those kinds silently owned their inherited
+        # topics: on one measured crawl only 148 of 1,850 models (8%) ever
+        # reached the walk.
+        inherits_topics = bool(base_model_id) and kind != "SHARED"
         overridden = self._overridden_topic_names(model_id) if is_workbook else None
 
         topics: list[dict[str, Any]] = []
@@ -520,7 +584,7 @@ class ClientClass:
             genuinely_overridden = (
                 is_workbook and overridden is not None and topic_name in overridden
             )
-            if is_workbook and not genuinely_overridden:
+            if inherits_topics and not genuinely_overridden:
                 owning_model_id = self._walk_to_shared_owner(model_id)
             else:
                 owning_model_id = model_id
@@ -545,7 +609,20 @@ class ClientClass:
                 else None
             )
             if detail is None:
-                detail = self._fetch_topic_detail(model_id, topic_name)
+                # `owning_model_id` — not `model_id`. When a workbook genuinely
+                # overrides the topic these are equal (see above), so overrides
+                # still fetch their own copy; when it merely inherits, every
+                # inheriting workbook shares one fetch.
+                detail = self._fetch_topic_detail_cached(owning_model_id, topic_name)
+                # ...but the walk deliberately climbs PAST SHARED_EXTENSION and
+                # BRANCH layers, so the ancestor may not own this topic at all
+                # (a BRANCH-defined topic, or an override probe that failed and
+                # defaulted to "inherited"). That 404s, and the swallow would
+                # turn it into {} — silently dropping source lineage and
+                # dimension/measure names with the run still reporting success.
+                # Retry against the model itself; costs a request only on miss.
+                if not detail and owning_model_id != model_id:
+                    detail = self._fetch_topic_detail_cached(model_id, topic_name)
             topic.update(detail)
             topics.append(topic)
         return topics
@@ -608,13 +685,39 @@ class ClientClass:
     def _views_from_payload(files: dict[str, Any]) -> dict[str, dict[str, Any]]:
         """Parse the `.view` files carried in a combined-mode YAML payload.
 
-        Keyed on the bare view name. Observed filename convention is
-        "<CATALOG>.<SCHEMA>/<view_name>.view" (e.g.
-        "WIDE_WORLD_IMPORTERS.PROCESSED_GOLD/dim_customer.view"); the directory
-        prefix only restates catalog/schema, both of which the view body also
-        carries, so the stem is all we need for lookup.
+        Registered under every form a topic may reference the view by, because
+        the file key and the reference genuinely differ. Measured against a live
+        Omni org:
+
+        | file key                                             | topic reference                                  |
+        |------------------------------------------------------|--------------------------------------------------|
+        | `WIDE_WORLD_IMPORTERS.PROCESSED_GOLD/dim_customer.view` | `wide_world_importers_processed_gold__dim_customer` |
+        | `DEMO/account.view`                                  | `demo__account`                                  |
+        | `user_order_facts.query.view`                         | `user_order_facts`                               |
+
+        So the reference is the full directory path lower-cased with `.` turned
+        into `_`, then `__`, then the stem — and a `.query` (or any dotted)
+        suffix on the stem is dropped. View bodies carry no `name` at all, so
+        the file key is the only source.
+
+        Registering only the bare stem is why local derivation missed on every
+        schema-namespaced org and fell through to the per-topic API: one
+        unresolvable name abandons the WHOLE topic, and `base_view` is a
+        required topic parameter, so it fired on effectively every topic. One
+        measured crawl fell back for 20,692 of 20,693 topics.
+
+        Registration is additive — an org that references views bare is
+        unaffected.
         """
         views: dict[str, dict[str, Any]] = {}
+
+        def _register(key: Any, parsed: dict[str, Any]) -> None:
+            if not key:
+                return
+            text = str(key)
+            views.setdefault(text, parsed)
+            views.setdefault(text.lower(), parsed)
+
         for file_name, file_content in files.items():
             if not file_name.endswith(".view"):
                 continue
@@ -624,8 +727,30 @@ class ClientClass:
                 continue
             if not isinstance(parsed, dict):
                 continue
-            stem = file_name.removesuffix(".view").split("/")[-1]
-            views[str(parsed.get("name") or stem)] = parsed
+
+            path = file_name.removesuffix(".view")
+            if "/" in path:
+                directory, stem = path.rsplit("/", 1)
+            else:
+                directory, stem = "", path
+
+            # "opportunity_facts.query" is referenced as "opportunity_facts"
+            stems = {stem}
+            if "." in stem:
+                stems.add(stem.split(".", 1)[0])
+
+            # "WIDE_WORLD_IMPORTERS.PROCESSED_GOLD" -> "wide_world_importers_processed_gold"
+            prefixes = set()
+            if directory:
+                prefixes.add(directory.replace(".", "_"))
+                # the trailing segment alone, for orgs that namespace by schema only
+                prefixes.add(directory.rsplit(".", 1)[-1])
+
+            _register(parsed.get("name"), parsed)
+            for st in stems:
+                _register(st, parsed)
+                for pref in prefixes:
+                    _register(f"{pref}__{st}", parsed)
         return views
 
     @staticmethod
@@ -736,10 +861,7 @@ class ClientClass:
         aliases = view_aliases or {}
         view_sources: list[dict[str, Any]] = []
         for view_name in ordered:
-            view = views.get(view_name)
-            if not isinstance(view, dict) and view_name in aliases:
-                # `joins` named a relationship alias; resolve to the real view.
-                view = views.get(aliases[view_name])
+            view = _resolve_view(views, aliases, view_name)
             if not isinstance(view, dict):
                 # Still unresolvable — an alias we could not map, or a view absent
                 # from the payload. Give up on local derivation for this topic so
@@ -760,9 +882,7 @@ class ClientClass:
                 }
             )
         base_view = (
-            views.get(base_view_name)
-            or views.get(aliases.get(base_view_name or "", ""))
-            or {}
+            _resolve_view(views, aliases, base_view_name) or {}
         ) if base_view_name else {}
         return {
             "sourceTableName": base_view.get("table_name"),
@@ -773,6 +893,30 @@ class ClientClass:
             "measureNames": [],
             "viewSources": view_sources,
         }
+
+    def _fetch_topic_detail_cached(
+        self, owning_model_id: str, topic_name: str
+    ) -> dict[str, Any]:
+        """Memoized `_fetch_topic_detail`, keyed on the OWNING model.
+
+        Only successful (non-empty) results are cached: caching `{}` would let
+        one transient failure permanently blank that topic for every workbook
+        in the run, which is a worse trade than re-attempting it.
+
+        A benign race can let two threads fetch the same key concurrently; the
+        lock is not held across the request, because doing so would serialise
+        the whole pool behind one HTTP call.
+        """
+        key = (owning_model_id, topic_name)
+        with self._topic_detail_cache_lock:
+            hit = self._topic_detail_cache.get(key)
+        if hit is not None:
+            return hit
+        detail = self._fetch_topic_detail(owning_model_id, topic_name)
+        if detail:
+            with self._topic_detail_cache_lock:
+                self._topic_detail_cache[key] = detail
+        return detail
 
     def _fetch_topic_detail(self, model_id: str, topic_name: str) -> dict[str, Any]:
         """Fetch enriched topic data via the topic API. Returns {} on any error.
@@ -942,6 +1086,7 @@ class ClientClass:
         self._abort = abort
         # Reset per-run failure counters.
         self._failures = {k: 0 for k in _FAILURE_CATEGORIES}
+        self._topic_detail_cache = {}
         connections = self.list_connections()
         logger.info(f"fetch_snapshot: {len(connections)} connections")
 
@@ -1003,6 +1148,29 @@ class ClientClass:
         # `omniV01BaseModel` edge behave exactly as before); the transformer
         # is the second gate that keeps content-less workbook ENTITIES out of
         # the catalog. Both gates share the same predicate for consistency.
+        # Document-detail failures leave document_model_ids INCOMPLETE, and the
+        # aggressive filter deletes any WORKBOOK absent from that set — so an
+        # incomplete set silently drops real, named workbooks while the run still
+        # reports success. Fail open: fall back to the conservative filter
+        # (unnamed content-less workbooks only) rather than deleting models on
+        # incomplete evidence.
+        # Thresholded, not any-failure: flipping this off widens the crawl from
+        # ~10% of models to 100%, so a single transient 500 among thousands of
+        # documents must not do it. Mirrors _MODEL_YAML_FAILURE_ABORT_THRESHOLD.
+        doc_failures = self._failures.get("document_detail", 0)
+        doc_failure_rate = doc_failures / max(len(documents), 1)
+        if (
+            doc_failure_rate > _DOCUMENT_DETAIL_DEGRADE_THRESHOLD
+            and crawl_only_content_backed_workbooks
+        ):
+            logger.warning(
+                f"document-detail fetch failed for {doc_failures}/{len(documents)} "
+                f"documents; document_model_ids is incomplete. Degrading "
+                f"crawl_only_content_backed_workbooks to False for this run so "
+                f"named workbooks are not dropped on incomplete evidence."
+            )
+            crawl_only_content_backed_workbooks = False
+
         topic_models = [
             m for m in models
             if not self._is_workbook_without_content(
@@ -1026,9 +1194,18 @@ class ClientClass:
                 topics.extend(future.result())
                 done_models += 1
                 if done_models % 5 == 0 or done_models == total_models:
+                    # Failure tallies ride the progress line. The end-of-pass
+                    # `fetch_snapshot failures:` summary below is never reached
+                    # by a run that times out mid-pass — which is exactly the
+                    # run whose failure counts you need.
                     logger.info(
                         f"fetch_snapshot progress: models {done_models}/{total_models}, "
-                        f"topics_so_far={len(topics)}"
+                        f"topics_so_far={len(topics)}, "
+                        f"topic_detail_cached={len(self._topic_detail_cache)}, "
+                        f"failures={{"
+                        f"model_yaml={self._failures['model_yaml']}, "
+                        f"topic_detail={self._failures['topic_detail']}, "
+                        f"document_detail={self._failures['document_detail']}}}"
                     )
 
         # Threshold check: abort BEFORE the transformer runs if the model pass
