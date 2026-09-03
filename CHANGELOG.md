@@ -4,7 +4,15 @@ All notable changes to the Omni connector are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.1] - 2026-08-31
+
+Follow-on fixes from Atlan's review of the v0.4.0 image on a large tenant
+whose extract activity hit the 8h ceiling. Root cause was a topic-detail
+fallback firing on ~all topics (20,692 of 20,693 on the affected org) and a
+per-workbook topic-detail fetch that turned 93 distinct topics into 25,831
+requests. Also fixes an Argo string-coercion bug that made
+`crawl_only_content_backed_workbooks=false` a no-op — same coercion
+silently ignored `verify_ssl=false`, which is security-relevant.
 
 ### Fixed
 
